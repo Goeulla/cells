@@ -304,12 +304,36 @@ def save_crossing_contact_sheet(video_path, per_rows, fps, out_path, crop=80, ma
         print(f"Could not reopen {video_path} to build contact sheet.")
         return
 
-    thumbs = []
-    for row in per_rows:
-        frame_idx = int(round(row["time_exit_s_abs"] * fps))
-        cap2.set(cv2.CAP_PROP_POS_FRAMES, max(0, frame_idx))
+    # cv2's frame-index seeking (CAP_PROP_POS_FRAMES) is unreliable on many
+    # compressed formats -- it can land near the nearest keyframe rather than the
+    # exact requested frame, silently cropping the wrong moment (showing no cell at
+    # all if it's since moved on). Seek once to a safe point well before the
+    # earliest needed frame, then advance with sequential reads only (always
+    # frame-accurate, tracked with an explicit counter) instead of re-seeking once
+    # per thumbnail.
+    needed = sorted({int(round(row["time_exit_s_abs"] * fps)) for row in per_rows})
+    seek_to = max(0, needed[0] - int(5 * fps))
+    cap2.set(cv2.CAP_PROP_POS_FRAMES, seek_to)
+
+    frame_by_idx = {}
+    cur, ni = seek_to, 0
+    while ni < len(needed):
         ret, frame = cap2.read()
         if not ret:
+            break
+        if cur == needed[ni]:
+            frame_by_idx[cur] = frame.copy()
+            ni += 1
+        cur += 1
+    cap2.release()
+
+    thumbs = []
+    n_missing = 0
+    for row in per_rows:
+        frame_idx = int(round(row["time_exit_s_abs"] * fps))
+        frame = frame_by_idx.get(frame_idx)
+        if frame is None:
+            n_missing += 1
             continue
         H, W = frame.shape[:2]
         x, y = int(row["x_exit"]), int(row["y_exit"])
@@ -318,13 +342,20 @@ def save_crossing_contact_sheet(video_path, per_rows, fps, out_path, crop=80, ma
         y0, y1 = max(0, y - half), min(H, y + half)
         thumb = frame[y0:y1, x0:x1]
         if thumb.size == 0:
+            n_missing += 1
             continue
         thumb = cv2.resize(thumb, (crop, crop))
         cv2.circle(thumb, (crop // 2, crop // 2), 3, (0, 255, 0), 1)
+        counted_as = row.get("counted_as", "speedbin")
+        # yellow = counted in a speed bin (part of total_counted); orange = only in
+        # total_cells via short_track/streak_only_short -- the ones most worth a
+        # second look, since they were only tracked a frame or two.
+        color = (0, 255, 255) if counted_as == "speedbin" else (0, 140, 255)
         label = f"{row['track_id']} {row['final_reason'][:4]}"
-        cv2.putText(thumb, label, (2, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1)
+        cv2.putText(thumb, label, (2, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
         thumbs.append(thumb)
-    cap2.release()
+    if n_missing:
+        print(f"Note: {n_missing} row(s) could not be re-extracted.")
 
     if not thumbs:
         print("Could not extract any crossing thumbnails (video re-seek failed).")
@@ -336,7 +367,8 @@ def save_crossing_contact_sheet(video_path, per_rows, fps, out_path, crop=80, ma
     thumbs += [np.zeros((crop, crop, 3), np.uint8)] * pad
     grid = np.vstack([np.hstack(thumbs[i * cols:(i + 1) * cols]) for i in range(n_rows)])
     cv2.imwrite(out_path, grid)
-    print(f"Wrote: {out_path} ({len(per_rows)} counted-cell thumbnails, {cols}x{n_rows} grid)")
+    print(f"Wrote: {out_path} ({len(thumbs) - pad}/{len(per_rows)} counted-cell thumbnails, "
+          f"{cols}x{n_rows} grid)")
 
 
 def main():
@@ -591,21 +623,27 @@ def main():
             recent_exits.popleft()
         tb  = int(t_rel // args.bin_seconds)
         thr = 1 if (args.allow_single_frame_count and reason == "passed_line")               else args.min_track_frames_for_speed
+        v = float(compute_speed(st))
         if st["seen_count"] >= thr:
-            v  = float(compute_speed(st))
             sb = bin_index(v, edges)
             if sb is not None:
                 counts[(tb, sb)] += 1
-            if args.per_object_csv:
-                per_rows.append(dict(
-                    track_id=tid, final_reason=reason,
-                    seen_count=st["seen_count"], is_streak=int(st["is_streak"]),
-                    speed=v, speed_unit="m/s" if args.m_per_px else "px/s",
-                    time_exit_s_abs=t_abs, time_exit_s_rel=t_rel,
-                    x_exit=x_e, y_exit=y_e))
+            counted_as = "speedbin"
         else:
             bucket = streak_only_counts if st["is_streak"] else short_track_counts
             bucket[tb] += 1
+            counted_as = "streak_only_short" if st["is_streak"] else "short_track"
+        # Always record a per_rows entry regardless of which bucket it landed in --
+        # short_track/streak cells are the ones most likely to be noise (only tracked
+        # a frame or two), so they're exactly the ones worth being able to verify,
+        # not ones to silently omit from per_object_csv/--verify_crossings_out.
+        if args.per_object_csv or args.verify_crossings_out:
+            per_rows.append(dict(
+                track_id=tid, final_reason=reason, counted_as=counted_as,
+                seen_count=st["seen_count"], is_streak=int(st["is_streak"]),
+                speed=v, speed_unit="m/s" if args.m_per_px else "px/s",
+                time_exit_s_abs=t_abs, time_exit_s_rel=t_rel,
+                x_exit=x_e, y_exit=y_e))
         return True
 
     while True:
