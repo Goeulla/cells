@@ -160,6 +160,89 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
     return out
 
 
+def detect_cells(th, frame, args, fg_thresh=None, min_peak_dist=None):
+    """
+    Mask -> contours -> filtered (cx, cy, is_streak) detections. Shared by the
+    real per-frame loop and the quick preview/sweep path so both always see
+    identical detection behavior. fg_thresh / min_peak_dist let the preview
+    path override the CLI values per-tile without touching args.
+    """
+    if args.use_watershed_split:
+        min_split = args.watershed_min_split_area or (1.8 * args.min_area)
+        if fg_thresh is None:
+            fg_thresh = args.watershed_fg_thresh
+        if min_peak_dist is None:
+            min_peak_dist = args.watershed_min_peak_dist or math.sqrt(min_split / (2 * math.pi))
+        contours = split_contours_watershed(th, frame, fg_thresh, args.min_area,
+                                            min_split_area=min_split,
+                                            min_peak_dist=min_peak_dist)
+    else:
+        contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    detections = []
+    det_boxes  = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < args.min_area or area > args.max_area:
+            continue
+        M = cv2.moments(c)
+        if M["m00"] == 0:
+            continue
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        x, y, w, h = cv2.boundingRect(c)
+        long_axis  = float(max(w, h))
+        short_axis = float(max(1, min(w, h)))
+        is_streak  = (args.enable_streak
+                      and area >= args.streak_min_area
+                      and long_axis >= args.streak_min_len
+                      and long_axis/short_axis >= args.streak_ar)
+        detections.append((cx, cy, is_streak))
+        det_boxes.append((x, y, w, h, is_streak))
+    return contours, detections, det_boxes
+
+
+def save_preview(th, frame, args):
+    """
+    Annotate one already-computed frame/mask with detected cell counts and
+    save it, instead of writing a full-video debug file. If --sweep_fg_thresh
+    and/or --sweep_min_peak_dist give more than one value, builds a grid with
+    one tile per combination (rows = min_peak_dist, cols = fg_thresh) so
+    several settings can be compared at a glance from a single frame.
+    """
+    if not args.use_watershed_split and (args.sweep_fg_thresh or args.sweep_min_peak_dist):
+        print("Note: --sweep_fg_thresh/--sweep_min_peak_dist only affect anything "
+              "when --use_watershed_split is also passed.")
+
+    fg_list = ([float(x) for x in args.sweep_fg_thresh.split(",")] if args.sweep_fg_thresh
+               else [args.watershed_fg_thresh])
+    if args.sweep_min_peak_dist:
+        pd_list = [float(x) for x in args.sweep_min_peak_dist.split(",")]
+    else:
+        min_split = args.watershed_min_split_area or (1.8 * args.min_area)
+        pd_list = [args.watershed_min_peak_dist or math.sqrt(min_split / (2 * math.pi))]
+
+    print(f"{'fg_thresh':>10} {'min_peak_dist':>14} {'count':>6}")
+    rows = []
+    for pd in pd_list:
+        tiles = []
+        for fg in fg_list:
+            _, detections, _ = detect_cells(th, frame, args, fg_thresh=fg, min_peak_dist=pd)
+            print(f"{fg:>10.2f} {pd:>14.2f} {len(detections):>6}")
+            tile = frame.copy()
+            for i, (cx, cy, _is_streak) in enumerate(detections):
+                cv2.circle(tile, (cx, cy), 3, (0, 255, 0), -1)
+                cv2.putText(tile, str(i + 1), (cx + 4, cy - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.putText(tile, f"fg={fg:g} d={pd:g} n={len(detections)}", (6, 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+            tiles.append(tile)
+        rows.append(np.hstack(tiles))
+    grid = np.vstack(rows)
+    cv2.imwrite(args.preview_out, grid)
+    print(f"Wrote: {args.preview_out}  ({len(pd_list)}x{len(fg_list)} grid)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True)
@@ -217,6 +300,22 @@ def main():
                          "be split into separate cells. Two touching cells closer together "
                          "than this are kept as one. Default: radius of a single cell, "
                          "estimated as sqrt(min_split_area / (2*pi)).")
+
+    ap.add_argument("--preview_frame_s", type=float, default=None,
+                    help="Quick-check mode: instead of processing the whole video, grab the "
+                         "frame this many seconds after --start_s, run detection on it, print "
+                         "the resulting cell count, save an annotated image to --preview_out, "
+                         "and exit. Runs in a fraction of a second instead of a full pass.")
+    ap.add_argument("--preview_out", default="preview.png",
+                    help="Where to save the annotated image for --preview_frame_s.")
+    ap.add_argument("--sweep_fg_thresh", type=str, default=None,
+                    help="Comma-separated watershed_fg_thresh values to compare side by side "
+                         "in the --preview_frame_s image (e.g. '0.5,0.6,0.7,0.8'). "
+                         "Default: just --watershed_fg_thresh.")
+    ap.add_argument("--sweep_min_peak_dist", type=str, default=None,
+                    help="Comma-separated watershed_min_peak_dist values to compare side by "
+                         "side in the --preview_frame_s image (e.g. '3,5,7,10'). "
+                         "Default: just --watershed_min_peak_dist / its auto default.")
 
     ap.add_argument("--min_track_frames_for_speed", type=int, default=3)
     ap.add_argument("--allow_single_frame_count",   action="store_true")
@@ -433,37 +532,13 @@ def main():
                                    iterations=args.edge_dilate)
             th = cv2.bitwise_and(th, cv2.bitwise_not(edges))
 
-        if args.use_watershed_split:
-            min_split = args.watershed_min_split_area or (1.8 * args.min_area)
-            min_peak_dist = args.watershed_min_peak_dist or math.sqrt(min_split / (2 * math.pi))
-            contours = split_contours_watershed(th, frame,
-                                                args.watershed_fg_thresh, args.min_area,
-                                                min_split_area=min_split,
-                                                min_peak_dist=min_peak_dist)
-        else:
-            contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if args.preview_frame_s is not None and (cur_frame / fps - start_s) >= args.preview_frame_s:
+            save_preview(th, frame, args)
+            cap.release()
+            if vw: vw.release()
+            return
 
-        detections = []
-        det_boxes  = []
-
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < args.min_area or area > args.max_area:
-                continue
-            M = cv2.moments(c)
-            if M["m00"] == 0:
-                continue
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            x, y, w, h = cv2.boundingRect(c)
-            long_axis  = float(max(w, h))
-            short_axis = float(max(1, min(w, h)))
-            is_streak  = (args.enable_streak
-                          and area >= args.streak_min_area
-                          and long_axis >= args.streak_min_len
-                          and long_axis/short_axis >= args.streak_ar)
-            detections.append((cx, cy, is_streak))
-            det_boxes.append((x, y, w, h, is_streak))
+        contours, detections, det_boxes = detect_cells(th, frame, args)
 
         for tid in tracks:
             tracks[tid]["updated"] = False
