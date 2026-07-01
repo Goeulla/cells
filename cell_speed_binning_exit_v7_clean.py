@@ -285,6 +285,60 @@ def save_preview(th, frame, gray, args):
     print(f"Wrote: {args.preview_out}  ({len(pd_list)}x{len(fg_list)} grid)")
 
 
+def save_crossing_contact_sheet(video_path, per_rows, fps, out_path, crop=80, max_cols=12):
+    """
+    One small thumbnail per counted cell, cropped from the real frame at the
+    moment it was counted (time_exit_s_abs/x_exit/y_exit from per_rows) and
+    centered with a marker. Lets someone verify precision (is each count a
+    real cell, not noise/debris) by glancing at a single image instead of
+    manually tallying crossings while watching the full video -- which isn't
+    practical for a fast, dense clip. Does not verify recall (missed cells
+    won't show up here since there's nothing to crop them from).
+    """
+    if not per_rows:
+        print("No counted cells to build a contact sheet from.")
+        return
+
+    cap2 = cv2.VideoCapture(video_path)
+    if not cap2.isOpened():
+        print(f"Could not reopen {video_path} to build contact sheet.")
+        return
+
+    thumbs = []
+    for row in per_rows:
+        frame_idx = int(round(row["time_exit_s_abs"] * fps))
+        cap2.set(cv2.CAP_PROP_POS_FRAMES, max(0, frame_idx))
+        ret, frame = cap2.read()
+        if not ret:
+            continue
+        H, W = frame.shape[:2]
+        x, y = int(row["x_exit"]), int(row["y_exit"])
+        half = crop // 2
+        x0, x1 = max(0, x - half), min(W, x + half)
+        y0, y1 = max(0, y - half), min(H, y + half)
+        thumb = frame[y0:y1, x0:x1]
+        if thumb.size == 0:
+            continue
+        thumb = cv2.resize(thumb, (crop, crop))
+        cv2.circle(thumb, (crop // 2, crop // 2), 3, (0, 255, 0), 1)
+        label = f"{row['track_id']} {row['final_reason'][:4]}"
+        cv2.putText(thumb, label, (2, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1)
+        thumbs.append(thumb)
+    cap2.release()
+
+    if not thumbs:
+        print("Could not extract any crossing thumbnails (video re-seek failed).")
+        return
+
+    cols = min(max_cols, len(thumbs))
+    n_rows = math.ceil(len(thumbs) / cols)
+    pad = cols * n_rows - len(thumbs)
+    thumbs += [np.zeros((crop, crop, 3), np.uint8)] * pad
+    grid = np.vstack([np.hstack(thumbs[i * cols:(i + 1) * cols]) for i in range(n_rows)])
+    cv2.imwrite(out_path, grid)
+    print(f"Wrote: {out_path} ({len(per_rows)} counted-cell thumbnails, {cols}x{n_rows} grid)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True)
@@ -400,6 +454,13 @@ def main():
     ap.add_argument("--no_pad_to_range_end", action="store_true")
     ap.add_argument("--out_csv",        default="speed_counts_per_time.csv")
     ap.add_argument("--per_object_csv", default=None)
+    ap.add_argument("--verify_crossings_out", default=None,
+                    help="Save a contact sheet of small thumbnails, one per counted cell, "
+                         "cropped from the real frame at the moment it was counted. Lets "
+                         "you sanity-check that each count is a real cell by looking at one "
+                         "image instead of trying to manually watch and tally crossings in "
+                         "the full video. Only checks precision (false positives), not "
+                         "recall (cells that were missed won't appear here).")
     ap.add_argument("--debug_video",    default=None)
     ap.add_argument("--debug_show_mask",action="store_true")
     ap.add_argument("--use_edge_barrier", action="store_true",
@@ -779,6 +840,8 @@ def main():
     print("Wrote:", xl)
     if args.per_object_csv:
         print("Wrote:", args.per_object_csv)
+    if args.verify_crossings_out:
+        save_crossing_contact_sheet(args.video, per_rows, fps, args.verify_crossings_out)
 
 
 if __name__ == "__main__":
