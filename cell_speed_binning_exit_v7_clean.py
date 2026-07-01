@@ -694,6 +694,16 @@ def main():
     cap.release()
     if vw: vw.release()
 
+    # Any track still active when the analyzed range ends (never crossed the exit
+    # line, never missed enough frames) would otherwise be silently dropped and
+    # never counted at all -- finalize what's left so in-flight cells aren't lost,
+    # especially significant for short --start_s/--end_s windows.
+    if last_processed is not None:
+        t_abs_end = last_processed / fps
+        for tid, st in list(tracks.items()):
+            finalize_track(t_abs_end, t_abs_end - start_s, st, tid, "end_of_range")
+        tracks.clear()
+
     if last_processed is None:
         duration_rel_s = 0.0
     elif end_frame_excl:
