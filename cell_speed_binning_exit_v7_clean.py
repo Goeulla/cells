@@ -480,11 +480,24 @@ def main():
         return cy <= m
 
     def is_duplicate_exit(t, x, y):
-        while recent_exits and t - recent_exits[0][0] > args.dedup_window:
-            recent_exits.popleft()
-        return any(abs(t-t0) <= args.dedup_window
-                   and math.hypot(x-x0, y-y0) <= args.dedup_dist
-                   for t0, x0, y0 in recent_exits)
+        # Drop stale entries by scanning the whole buffer rather than just the front:
+        # a lingering cell refreshes its entry's timestamp below, so the buffer is not
+        # guaranteed sorted by time and a front-only pop would leave old entries stuck.
+        kept = [(t0, x0, y0) for (t0, x0, y0) in recent_exits if t - t0 <= args.dedup_window]
+        for i, (t0, x0, y0) in enumerate(kept):
+            if math.hypot(x - x0, y - y0) <= args.dedup_dist:
+                # Refresh instead of leaving the original timestamp: a cell that just
+                # sits in the exit margin re-triggers crossed_exit() every frame (its
+                # track gets deleted and immediately recreated), and without refreshing,
+                # this entry would expire after exactly one dedup_window and let the
+                # same still-lingering cell be counted again as a new exit.
+                kept[i] = (t, x0, y0)
+                recent_exits.clear()
+                recent_exits.extend(kept)
+                return True
+        recent_exits.clear()
+        recent_exits.extend(kept)
+        return False
 
     def compute_speed(st):
         dt = max(1, st["last_seen_frame"] - st["first_frame"]) / fps
