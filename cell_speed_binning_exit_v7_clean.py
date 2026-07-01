@@ -160,7 +160,7 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
     return out
 
 
-def detect_cells(th, frame, args, fg_thresh=None, min_peak_dist=None):
+def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None):
     """
     Mask -> contours -> filtered (cx, cy, is_streak) detections. Shared by the
     real per-frame loop and the quick preview/sweep path so both always see
@@ -185,6 +185,12 @@ def detect_cells(th, frame, args, fg_thresh=None, min_peak_dist=None):
         area = cv2.contourArea(c)
         if area < args.min_area or area > args.max_area:
             continue
+        if args.min_mean_intensity > 0:
+            blob_mask = np.zeros(gray.shape, dtype=np.uint8)
+            cv2.drawContours(blob_mask, [c], -1, 255, -1)
+            mean_intensity = cv2.mean(gray, mask=blob_mask)[0]
+            if mean_intensity < args.min_mean_intensity:
+                continue  # dark/black blob (e.g. debris, dead cell) - not counted
         M = cv2.moments(c)
         if M["m00"] == 0:
             continue
@@ -202,7 +208,7 @@ def detect_cells(th, frame, args, fg_thresh=None, min_peak_dist=None):
     return contours, detections, det_boxes
 
 
-def save_preview(th, frame, args):
+def save_preview(th, frame, gray, args):
     """
     Annotate one already-computed frame/mask with detected cell counts and
     save it, instead of writing a full-video debug file. If --sweep_fg_thresh
@@ -227,7 +233,7 @@ def save_preview(th, frame, args):
     for pd in pd_list:
         tiles = []
         for fg in fg_list:
-            _, detections, _ = detect_cells(th, frame, args, fg_thresh=fg, min_peak_dist=pd)
+            _, detections, _ = detect_cells(th, frame, gray, args, fg_thresh=fg, min_peak_dist=pd)
             print(f"{fg:>10.2f} {pd:>14.2f} {len(detections):>6}")
             tile = frame.copy()
             for i, (cx, cy, _is_streak) in enumerate(detections):
@@ -258,6 +264,12 @@ def main():
     ap.add_argument("--max_area",   type=float, default=8000)
     ap.add_argument("--max_dist",   type=float, default=220)
     ap.add_argument("--max_missed", type=int,   default=20)
+    ap.add_argument("--min_mean_intensity", type=float, default=0.0,
+                    help="Minimum mean grayscale intensity (0-255) inside a detected blob "
+                         "for it to be counted as a cell. Blobs darker than this ('black' "
+                         "cells, debris, dead cells) are discarded before tracking. "
+                         "Default 0 = no filtering. Use --preview_frame_s to check a value "
+                         "against a real frame before committing to a full run.")
 
     ap.add_argument("--mog2_history",      type=int,   default=500)
     ap.add_argument("--mog2_varThreshold", type=float, default=16)
@@ -552,12 +564,12 @@ def main():
             th = cv2.bitwise_and(th, cv2.bitwise_not(edges))
 
         if args.preview_frame_s is not None and (cur_frame / fps - start_s) >= args.preview_frame_s:
-            save_preview(th, frame, args)
+            save_preview(th, frame, gray, args)
             cap.release()
             if vw: vw.release()
             return
 
-        contours, detections, det_boxes = detect_cells(th, frame, args)
+        contours, detections, det_boxes = detect_cells(th, frame, gray, args)
 
         for tid in tracks:
             tracks[tid]["updated"] = False
