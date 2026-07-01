@@ -382,6 +382,16 @@ def main():
     ap.add_argument("--exit_side",      type=str, default="right",
                     choices=["right","left","top","bottom"])
     ap.add_argument("--exit_margin_px", type=int, default=10)
+    ap.add_argument("--end_of_range_margin_px", type=int, default=60,
+                    help="When the analyzed range ends, a still-active track is only "
+                         "counted if it's within this many px of the exit boundary "
+                         "(catches cells that were genuinely about to cross when the clip "
+                         "cut off). Tracks further from the boundary than this are dropped, "
+                         "not counted -- they clearly hadn't reached the exit within the "
+                         "observed window, e.g. a cell sitting in the middle of the frame "
+                         "the whole time. Should be noticeably larger than --exit_margin_px "
+                         "(which is checked every frame already) or nothing extra gets "
+                         "caught; set to 0 to disable end-of-range counting entirely.")
 
     ap.add_argument("--draw_scalebar", action="store_true")
     ap.add_argument("--scalebar_um",   type=float, default=10.0)
@@ -474,6 +484,12 @@ def main():
 
     def crossed_exit(cx, cy):
         m = args.exit_margin_px
+        if args.exit_side == "right":  return cx >= W - 1 - m
+        if args.exit_side == "left":   return cx <= m
+        if args.exit_side == "bottom": return cy >= H - 1 - m
+        return cy <= m
+
+    def near_exit(cx, cy, m):
         if args.exit_side == "right":  return cx >= W - 1 - m
         if args.exit_side == "left":   return cx <= m
         if args.exit_side == "bottom": return cy >= H - 1 - m
@@ -707,14 +723,16 @@ def main():
     cap.release()
     if vw: vw.release()
 
-    # Any track still active when the analyzed range ends (never crossed the exit
-    # line, never missed enough frames) would otherwise be silently dropped and
-    # never counted at all -- finalize what's left so in-flight cells aren't lost,
-    # especially significant for short --start_s/--end_s windows.
-    if last_processed is not None:
+    # A track still active when the analyzed range ends (never crossed the exit line,
+    # never missed enough frames) is only counted if it's actually near the exit
+    # boundary -- i.e. it was genuinely about to cross when the clip cut off. A track
+    # anywhere else in the frame (e.g. a cell just sitting/drifting mid-frame the whole
+    # window) is dropped, not counted: it never demonstrated it was exiting at all.
+    if last_processed is not None and args.end_of_range_margin_px > 0:
         t_abs_end = last_processed / fps
         for tid, st in list(tracks.items()):
-            finalize_track(t_abs_end, t_abs_end - start_s, st, tid, "end_of_range")
+            if near_exit(st["cx"], st["cy"], args.end_of_range_margin_px):
+                finalize_track(t_abs_end, t_abs_end - start_s, st, tid, "end_of_range")
         tracks.clear()
 
     if last_processed is None:
