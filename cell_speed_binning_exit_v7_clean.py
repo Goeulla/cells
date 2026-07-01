@@ -384,6 +384,21 @@ def main():
     H, W = frame0.shape[:2]
     scalebar_px = max(1, int(round(args.scalebar_um / args.um_per_px)))
 
+    if args.preview_frame_s is not None:
+        total_frames  = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        video_len_s    = (total_frames / fps) if total_frames > 0 else None
+        target_abs_s   = start_s + args.preview_frame_s
+        frames_to_scan = int(args.preview_frame_s * fps) + warmup_frames
+        if video_len_s is not None and target_abs_s > video_len_s:
+            print(f"WARNING: --preview_frame_s {args.preview_frame_s:g} (+ --start_s "
+                  f"{start_s:g}) = {target_abs_s:.1f}s, but the video is only "
+                  f"~{video_len_s:.1f}s long. --preview_frame_s counts SECONDS after "
+                  f"--start_s, not a frame number. The preview target will never be "
+                  f"reached, so this will scan the ENTIRE video (same cost as a full run) "
+                  f"before falling through to normal output instead of a quick preview.")
+        print(f"Quick check: scanning ~{frames_to_scan} frame(s) "
+              f"(~{frames_to_scan/fps:.1f}s of video) before the preview point...")
+
     backsub = cv2.createBackgroundSubtractorMOG2(
         history=args.mog2_history,
         varThreshold=args.mog2_varThreshold,
@@ -465,6 +480,10 @@ def main():
         cur_frame = abs_frame
         abs_frame += 1
         last_processed = cur_frame
+
+        if args.preview_frame_s is not None and cur_frame % 200 == 0:
+            print(f"  ...scanned frame {cur_frame} (t={cur_frame/fps:.1f}s), "
+                  f"target {start_s + args.preview_frame_s:.1f}s", flush=True)
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if args.gauss_ksize > 0:
