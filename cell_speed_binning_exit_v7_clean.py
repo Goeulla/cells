@@ -110,6 +110,13 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
     _, mask = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY)
     raw_contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    # Returns (contour, seed_xy) pairs. seed_xy is the exact distance-transform peak
+    # pixel for a split cell (the true, accurate cell center); None for a pass-through
+    # unsplit contour, where the caller should fall back to the contour's centroid
+    # (fine there since it's a single symmetric blob). Using the split *region*'s own
+    # centroid instead of its seed is wrong: an uneven/asymmetric split (very common
+    # for cells overlapping unevenly) produces a lopsided region whose centroid can
+    # land noticeably off the real cell, especially visible for close/touching pairs.
     out = []
     for rc in raw_contours:
         area = cv2.contourArea(rc)
@@ -118,7 +125,7 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
 
         # small blobs → single cell, skip splitting
         if area < min_split_area:
-            out.append(rc)
+            out.append((rc, None))
             continue
 
         # isolate blob
@@ -127,7 +134,7 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
 
         dist = cv2.distanceTransform(blob_mask, cv2.DIST_L2, 5)
         if dist.max() <= 0:
-            out.append(rc)
+            out.append((rc, None))
             continue
 
         coords = peak_local_max(dist, min_distance=max(1, int(min_peak_dist)),
@@ -136,12 +143,17 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
 
         if len(coords) <= 1:
             # only one cell center found → single cell
-            out.append(rc)
+            out.append((rc, None))
             continue
 
         peak_mask = np.zeros(dist.shape, dtype=bool)
         peak_mask[tuple(coords.T)] = True
         markers, n_seeds = ndi.label(peak_mask)
+
+        # map each marker label to the exact peak pixel (row, col) that produced it
+        label_to_seed = {}
+        for (py, px) in coords:
+            label_to_seed[markers[py, px]] = (float(px), float(py))
 
         labels = sk_watershed(-dist, markers, mask=blob_mask)
 
@@ -151,11 +163,11 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
             cs, _ = cv2.findContours(obj, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for c in cs:
                 if cv2.contourArea(c) >= min_area:
-                    out.append(c)
+                    out.append((c, label_to_seed.get(label)))
                     split_any = True
 
         if not split_any:
-            out.append(rc)
+            out.append((rc, None))
 
     return out
 
@@ -173,15 +185,16 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None):
             fg_thresh = args.watershed_fg_thresh
         if min_peak_dist is None:
             min_peak_dist = args.watershed_min_peak_dist or math.sqrt(min_split / (2 * math.pi))
-        contours = split_contours_watershed(th, frame, fg_thresh, args.min_area,
+        contour_seed_pairs = split_contours_watershed(th, frame, fg_thresh, args.min_area,
                                             min_split_area=min_split,
                                             min_peak_dist=min_peak_dist)
     else:
-        contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cs, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contour_seed_pairs = [(c, None) for c in cs]
 
     detections = []
     det_boxes  = []
-    for c in contours:
+    for c, seed in contour_seed_pairs:
         area = cv2.contourArea(c)
         if area < args.min_area or area > args.max_area:
             continue
@@ -191,11 +204,16 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None):
             mean_intensity = cv2.mean(gray, mask=blob_mask)[0]
             if mean_intensity < args.min_mean_intensity:
                 continue  # dark/black blob (e.g. debris, dead cell) - not counted
-        M = cv2.moments(c)
-        if M["m00"] == 0:
-            continue
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
+        if seed is not None:
+            # true distance-transform peak for a split cell -- accurate even when
+            # the split region itself is lopsided/asymmetric
+            cx, cy = int(round(seed[0])), int(round(seed[1]))
+        else:
+            M = cv2.moments(c)
+            if M["m00"] == 0:
+                continue
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
         x, y, w, h = cv2.boundingRect(c)
         long_axis  = float(max(w, h))
         short_axis = float(max(1, min(w, h)))
@@ -205,7 +223,7 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None):
                       and long_axis/short_axis >= args.streak_ar)
         detections.append((cx, cy, is_streak))
         det_boxes.append((x, y, w, h, is_streak))
-    return contours, detections, det_boxes
+    return [c for c, _ in contour_seed_pairs], detections, det_boxes
 
 
 def print_blob_size_diagnostics(th, args):
