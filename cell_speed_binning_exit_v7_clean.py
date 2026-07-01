@@ -208,6 +208,40 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None):
     return contours, detections, det_boxes
 
 
+def print_blob_size_diagnostics(th, args):
+    """
+    Report the actual raw-blob-area distribution in this frame (before any
+    --min_area/--max_area/watershed filtering) and back out suggested values
+    for --min_area / --watershed_min_split_area / --watershed_min_peak_dist
+    from it, so those don't have to be guessed from a screenshot. A blob-size
+    mismatch here (e.g. --min_area tuned for a few-px speck when real cells
+    are tens of px across) is what causes watershed to shred single cells
+    into dozens of pieces -- watershed_min_peak_dist auto-derives from
+    min_area, so an undersized min_area makes it absurdly small.
+    """
+    raw_contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    areas = np.array([cv2.contourArea(c) for c in raw_contours])
+    areas = areas[areas > 0]
+    if len(areas) == 0:
+        print("No foreground blobs found in this frame (mask is empty) -- check "
+              "--mask_thresh / --mog2_varThreshold, or that warmup has enough frames.")
+        return
+    p10, p25, med, p75, p90 = np.percentile(areas, [10, 25, 50, 75, 90])
+    print(f"\nRaw blob areas this frame, before --min_area/--max_area filtering "
+          f"(n={len(areas)} blobs):")
+    print(f"  min={areas.min():.0f}  p10={p10:.0f}  p25={p25:.0f}  median={med:.0f}  "
+          f"p75={p75:.0f}  p90={p90:.0f}  max={areas.max():.0f}")
+    suggested_min_area  = max(1, round(med * 0.3))
+    suggested_min_split = round(med * 1.5)
+    suggested_peak_dist = max(1, round(math.sqrt(med / (2 * math.pi))))
+    print(f"  Current --min_area={args.min_area:g}. If the median blob (~{med:.0f}px²) "
+          f"is roughly one cell, try:")
+    print(f"    --min_area {suggested_min_area} --watershed_min_split_area "
+          f"{suggested_min_split} --watershed_min_peak_dist {suggested_peak_dist}")
+    print(f"  (median is only a rough estimate -- it's skewed up if many blobs here are "
+          f"already touching pairs, and down if there's a lot of small debris)\n")
+
+
 def save_preview(th, frame, gray, args):
     """
     Annotate one already-computed frame/mask with detected cell counts and
@@ -216,6 +250,8 @@ def save_preview(th, frame, gray, args):
     one tile per combination (rows = min_peak_dist, cols = fg_thresh) so
     several settings can be compared at a glance from a single frame.
     """
+    print_blob_size_diagnostics(th, args)
+
     if not args.use_watershed_split and (args.sweep_fg_thresh or args.sweep_min_peak_dist):
         print("Note: --sweep_fg_thresh/--sweep_min_peak_dist only affect anything "
               "when --use_watershed_split is also passed.")
