@@ -838,8 +838,17 @@ def main():
             if not st["updated"]:
                 st["missed_count"] += 1
                 if st["missed_count"] > args.max_missed:
-                    t_abs = st["last_seen_frame"] / fps
-                    finalize_track(t_abs, t_abs-start_s, st, tid, "missing")
+                    # Only count a lost track if it was actually near the exit boundary
+                    # when lost (genuinely mid-crossing, e.g. fragmented right at the
+                    # edge) -- same reasoning as end_of_range. A track lost anywhere
+                    # else in the frame (occlusion, a brief detection gap, MOG2 losing
+                    # it mid-frame) never demonstrated it was exiting and should just be
+                    # dropped, not counted as a cell that passed the FOV. Confirmed via
+                    # --verify_crossings_out: a "missing" cell counted near the bottom
+                    # of a "top"-exit frame, nowhere near the boundary.
+                    if near_exit(st["cx"], st["cy"], args.end_of_range_margin_px):
+                        t_abs = st["last_seen_frame"] / fps
+                        finalize_track(t_abs, t_abs-start_s, st, tid, "missing")
                     tracks.pop(tid, None)
 
         if vw is not None:
