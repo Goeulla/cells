@@ -471,6 +471,16 @@ def main():
 
     ap.add_argument("--min_track_frames_for_speed", type=int, default=3)
     ap.add_argument("--allow_single_frame_count",   action="store_true")
+    ap.add_argument("--min_seen_count", type=int, default=2,
+                    help="Minimum number of frames a detection must be matched across "
+                         "before it counts as a cell at all (in ANY bucket -- speedbin, "
+                         "short_track, or streak_only), not just before it gets a speed "
+                         "bin. Filters one-frame noise blips (compression/sensor artifacts "
+                         "that happen to have cell-like size/shape) that would otherwise "
+                         "still land in short_track and inflate total_cells. Overridden by "
+                         "--allow_single_frame_count for passed_line cells specifically, "
+                         "since that flag's whole purpose is to permit instant single-frame "
+                         "counts. Set to 1 to disable and count any single-frame detection.")
 
     ap.add_argument("--enable_streak",       action="store_true")
     ap.add_argument("--streak_ar",           type=float, default=2.2)
@@ -636,11 +646,20 @@ def main():
         x_e, y_e = float(st["end_x"]), float(st["end_y"])
         if is_duplicate_exit(t_abs, x_e, y_e):
             return False
+        allow_instant = args.allow_single_frame_count and reason == "passed_line"
+        if not allow_instant and st["seen_count"] < args.min_seen_count:
+            # A detection only ever matched this few times was never confirmed as a
+            # persistent, real object -- could be a single-frame noise blip (compression
+            # artifact, sensor noise) that happens to have cell-like size/shape. Drop it
+            # entirely rather than counting it in short_track/streak_only_short, and
+            # don't record it in recent_exits either so it can't block a genuine later
+            # detection at the same spot from being counted via dedup.
+            return False
         recent_exits.append((t_abs, x_e, y_e))
         if len(recent_exits) > args.dedup_keep:
             recent_exits.popleft()
         tb  = int(t_rel // args.bin_seconds)
-        thr = 1 if (args.allow_single_frame_count and reason == "passed_line")               else args.min_track_frames_for_speed
+        thr = 1 if allow_instant else args.min_track_frames_for_speed
         v = float(compute_speed(st))
         if st["seen_count"] >= thr:
             sb = bin_index(v, edges)
