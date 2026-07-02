@@ -90,8 +90,54 @@ def hungarian_match(tracks, detections, max_dist):
     return pairs, set(range(n_d)) - matched
 
 
+def find_seeds_prominence(dist, blob_mask, fg_thresh, prominence_frac, candidate_min_dist):
+    """
+    Seed-finding that separates two concerns min_peak_dist conflates: "is this a
+    distinct peak at all" (candidate_min_dist, kept small) vs "is it tall enough
+    relative to its neighbor to really be a separate cell, not noise" (prominence).
+
+    Pure distance-based filtering (peak_local_max with a single min_distance) can't
+    do both at once: a distance large enough to reject noise bumps also makes it
+    mechanically impossible to split two real cells whose centers are closer
+    together than that distance -- common in dense/tightly-clustered regions, where
+    a whole multi-cell cluster can be smaller across than the distance threshold
+    itself. Prominence instead asks: how much does this peak's height exceed the
+    saddle (the lowest point along the ridge) between it and its nearest taller
+    neighbor? A real second cell has a deep saddle (its own distinct falloff to
+    background); a noise bump on the shoulder of one real cell has a shallow one.
+
+    Finds many close-together candidate peaks first (small candidate_min_dist),
+    then greedily merges each into its nearest taller neighbor if the saddle
+    between them isn't deep enough (prominence < prominence_frac * dist.max()).
+    """
+    coords = peak_local_max(dist, min_distance=max(1, int(candidate_min_dist)),
+                             threshold_abs=fg_thresh * dist.max(), labels=blob_mask)
+    if len(coords) <= 1:
+        return coords
+    heights = dist[coords[:, 0], coords[:, 1]]
+    order = np.argsort(-heights)  # tallest first
+    prominence_thresh = prominence_frac * dist.max()
+
+    kept = []  # (y, x, h), tallest-first order preserved
+    for idx in order:
+        y, x = coords[idx]
+        h = heights[idx]
+        merged = False
+        for ky, kx, kh in kept:
+            n_samples = max(2, int(math.hypot(x - kx, y - ky)))
+            xs = np.clip(np.linspace(x, kx, n_samples).astype(int), 0, dist.shape[1] - 1)
+            ys = np.clip(np.linspace(y, ky, n_samples).astype(int), 0, dist.shape[0] - 1)
+            saddle = dist[ys, xs].min()
+            if h - saddle < prominence_thresh:
+                merged = True
+                break
+        if not merged:
+            kept.append((y, x, h))
+    return np.array([[y, x] for y, x, h in kept])
+
+
 def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_split_area,
-                              min_peak_dist):
+                              min_peak_dist, prominence_frac=None):
     """
     Split touching/overlapping cells using a distance-transform watershed.
 
@@ -137,9 +183,13 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
             out.append((rc, None))
             continue
 
-        coords = peak_local_max(dist, min_distance=max(1, int(min_peak_dist)),
-                                 threshold_abs=fg_thresh * dist.max(),
-                                 labels=blob_mask)
+        if prominence_frac is not None:
+            coords = find_seeds_prominence(dist, blob_mask, fg_thresh, prominence_frac,
+                                            candidate_min_dist=min_peak_dist)
+        else:
+            coords = peak_local_max(dist, min_distance=max(1, int(min_peak_dist)),
+                                     threshold_abs=fg_thresh * dist.max(),
+                                     labels=blob_mask)
 
         if len(coords) <= 1:
             # only one cell center found → single cell
@@ -172,12 +222,12 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
     return out
 
 
-def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None):
+def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prominence_frac=None):
     """
     Mask -> contours -> filtered (cx, cy, is_streak) detections. Shared by the
     real per-frame loop and the quick preview/sweep path so both always see
-    identical detection behavior. fg_thresh / min_peak_dist let the preview
-    path override the CLI values per-tile without touching args.
+    identical detection behavior. fg_thresh / min_peak_dist / prominence_frac let
+    the preview path override the CLI values per-tile without touching args.
     """
     if args.use_watershed_split:
         min_split = args.watershed_min_split_area or (1.8 * args.min_area)
@@ -185,9 +235,12 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None):
             fg_thresh = args.watershed_fg_thresh
         if min_peak_dist is None:
             min_peak_dist = args.watershed_min_peak_dist or math.sqrt(min_split / (2 * math.pi))
+        if prominence_frac is None:
+            prominence_frac = args.watershed_prominence_frac
         contour_seed_pairs = split_contours_watershed(th, frame, fg_thresh, args.min_area,
                                             min_split_area=min_split,
-                                            min_peak_dist=min_peak_dist)
+                                            min_peak_dist=min_peak_dist,
+                                            prominence_frac=prominence_frac)
     else:
         cs, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contour_seed_pairs = [(c, None) for c in cs]
@@ -267,40 +320,60 @@ def save_preview(th, frame, gray, args):
     and/or --sweep_min_peak_dist give more than one value, builds a grid with
     one tile per combination (rows = min_peak_dist, cols = fg_thresh) so
     several settings can be compared at a glance from a single frame.
+
+    If --sweep_prominence_frac is given, it replaces --sweep_min_peak_dist as
+    the row axis (prominence and min_peak_dist both control split sensitivity,
+    so sweeping both at once isn't useful) -- --watershed_min_peak_dist is then
+    held fixed as the candidate-peak spacing for every tile.
     """
     print_blob_size_diagnostics(th, args)
 
-    if not args.use_watershed_split and (args.sweep_fg_thresh or args.sweep_min_peak_dist):
-        print("Note: --sweep_fg_thresh/--sweep_min_peak_dist only affect anything "
-              "when --use_watershed_split is also passed.")
+    if not args.use_watershed_split and (args.sweep_fg_thresh or args.sweep_min_peak_dist
+                                          or args.sweep_prominence_frac):
+        print("Note: --sweep_fg_thresh/--sweep_min_peak_dist/--sweep_prominence_frac only "
+              "affect anything when --use_watershed_split is also passed.")
 
     fg_list = ([float(x) for x in args.sweep_fg_thresh.split(",")] if args.sweep_fg_thresh
                else [args.watershed_fg_thresh])
-    if args.sweep_min_peak_dist:
-        pd_list = [float(x) for x in args.sweep_min_peak_dist.split(",")]
-    else:
-        min_split = args.watershed_min_split_area or (1.8 * args.min_area)
-        pd_list = [args.watershed_min_peak_dist or math.sqrt(min_split / (2 * math.pi))]
 
-    print(f"{'fg_thresh':>10} {'min_peak_dist':>14} {'count':>6}")
+    if args.sweep_prominence_frac:
+        row_label = "prominence_frac"
+        row_list = [float(x) for x in args.sweep_prominence_frac.split(",")]
+        fixed_pd = args.watershed_min_peak_dist or 4
+        def make_kwargs(row_val):
+            return dict(min_peak_dist=fixed_pd, prominence_frac=row_val)
+    elif args.sweep_min_peak_dist:
+        row_label = "min_peak_dist"
+        row_list = [float(x) for x in args.sweep_min_peak_dist.split(",")]
+        def make_kwargs(row_val):
+            return dict(min_peak_dist=row_val, prominence_frac=args.watershed_prominence_frac)
+    else:
+        row_label = "min_peak_dist"
+        min_split = args.watershed_min_split_area or (1.8 * args.min_area)
+        row_list = [args.watershed_min_peak_dist or math.sqrt(min_split / (2 * math.pi))]
+        def make_kwargs(row_val):
+            return dict(min_peak_dist=row_val, prominence_frac=args.watershed_prominence_frac)
+
+    print(f"{'fg_thresh':>10} {row_label:>16} {'count':>6}")
     rows = []
-    for pd in pd_list:
+    for row_val in row_list:
         tiles = []
         for fg in fg_list:
-            _, detections, _ = detect_cells(th, frame, gray, args, fg_thresh=fg, min_peak_dist=pd)
-            print(f"{fg:>10.2f} {pd:>14.2f} {len(detections):>6}")
+            _, detections, _ = detect_cells(th, frame, gray, args, fg_thresh=fg,
+                                             **make_kwargs(row_val))
+            print(f"{fg:>10.2f} {row_val:>16.2f} {len(detections):>6}")
             tile = frame.copy()
             for i, (cx, cy, _is_streak) in enumerate(detections):
                 cv2.circle(tile, (cx, cy), 3, (0, 255, 0), -1)
                 cv2.putText(tile, str(i + 1), (cx + 4, cy - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            cv2.putText(tile, f"fg={fg:g} d={pd:g} n={len(detections)}", (6, 16),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+            cv2.putText(tile, f"fg={fg:g} {row_label[:4]}={row_val:g} n={len(detections)}",
+                        (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
             tiles.append(tile)
         rows.append(np.hstack(tiles))
     grid = np.vstack(rows)
     cv2.imwrite(args.preview_out, grid)
-    print(f"Wrote: {args.preview_out}  ({len(pd_list)}x{len(fg_list)} grid)")
+    print(f"Wrote: {args.preview_out}  ({len(row_list)}x{len(fg_list)} grid)")
 
 
 def save_crossing_contact_sheet(video_path, per_rows, fps, out_path, crop=120, max_cols=10):
@@ -471,7 +544,24 @@ def main():
                     help="Minimum distance (px) between two cell-center seeds for them to "
                          "be split into separate cells. Two touching cells closer together "
                          "than this are kept as one. Default: radius of a single cell, "
-                         "estimated as sqrt(min_split_area / (2*pi)).")
+                         "estimated as sqrt(min_split_area / (2*pi)). When "
+                         "--watershed_prominence_frac is set, this becomes the initial "
+                         "candidate-peak spacing instead (can be set much smaller, e.g. 4-5, "
+                         "since prominence handles rejecting noise instead).")
+    ap.add_argument("--watershed_prominence_frac", type=float, default=None,
+                    help="Enables prominence-based seed filtering instead of pure distance: "
+                         "a candidate peak is kept only if it stands at least this fraction "
+                         "of the blob's own max distance-transform value above the saddle "
+                         "(lowest ridge point) to its nearest taller neighbor. Distinguishes "
+                         "a real second cell (deep saddle) from a noise bump on the shoulder "
+                         "of one cell (shallow saddle), so tightly-clustered real cells whose "
+                         "centers are closer together than --watershed_min_peak_dist can "
+                         "still be split correctly -- which plain distance-based filtering "
+                         "can never do (mechanically impossible once a cluster's own extent "
+                         "is smaller than min_peak_dist). Try 0.15-0.25. Recommended to pair "
+                         "with --min_mean_intensity: this surfaces dark debris specks as "
+                         "separate seeds that a coarser distance-only split used to silently "
+                         "absorb into one blob. Default None = disabled (unchanged behavior).")
 
     ap.add_argument("--preview_frame_s", type=float, default=None,
                     help="Quick-check mode: instead of processing the whole video, grab the "
@@ -487,7 +577,14 @@ def main():
     ap.add_argument("--sweep_min_peak_dist", type=str, default=None,
                     help="Comma-separated watershed_min_peak_dist values to compare side by "
                          "side in the --preview_frame_s image (e.g. '3,5,7,10'). "
-                         "Default: just --watershed_min_peak_dist / its auto default.")
+                         "Default: just --watershed_min_peak_dist / its auto default. Ignored "
+                         "if --sweep_prominence_frac is given.")
+    ap.add_argument("--sweep_prominence_frac", type=str, default=None,
+                    help="Comma-separated watershed_prominence_frac values to compare side by "
+                         "side in the --preview_frame_s image (e.g. '0.1,0.15,0.2,0.25'). "
+                         "Replaces --sweep_min_peak_dist as the grid's row axis when given; "
+                         "--watershed_min_peak_dist is held fixed as the candidate-peak "
+                         "spacing (small, e.g. 4-5) for every tile.")
 
     ap.add_argument("--min_track_frames_for_speed", type=int, default=3)
     ap.add_argument("--allow_single_frame_count",   action="store_true")
