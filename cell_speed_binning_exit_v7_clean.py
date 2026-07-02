@@ -486,16 +486,17 @@ def main():
 
     ap.add_argument("--min_track_frames_for_speed", type=int, default=3)
     ap.add_argument("--allow_single_frame_count",   action="store_true")
-    ap.add_argument("--min_seen_count", type=int, default=2,
+    ap.add_argument("--min_seen_count", type=int, default=1,
                     help="Minimum number of frames a detection must be matched across "
                          "before it counts as a cell at all (in ANY bucket -- speedbin, "
                          "short_track, or streak_only), not just before it gets a speed "
-                         "bin. Filters one-frame noise blips (compression/sensor artifacts "
-                         "that happen to have cell-like size/shape) that would otherwise "
-                         "still land in short_track and inflate total_cells. Overridden by "
-                         "--allow_single_frame_count for passed_line cells specifically, "
-                         "since that flag's whole purpose is to permit instant single-frame "
-                         "counts. Set to 1 to disable and count any single-frame detection.")
+                         "bin. Default 1 counts any detection, including one-frame blips. "
+                         "Raise to e.g. 2 to filter out one-frame noise (compression/sensor "
+                         "artifacts that happen to have cell-like size/shape) at the cost of "
+                         "also dropping any real cell only visible for a single frame. "
+                         "Overridden by --allow_single_frame_count for passed_line cells "
+                         "specifically, since that flag's whole purpose is to permit instant "
+                         "single-frame counts.")
 
     ap.add_argument("--enable_streak",       action="store_true")
     ap.add_argument("--streak_ar",           type=float, default=2.2)
