@@ -144,9 +144,45 @@ def find_seeds_prominence(height_map, blob_mask, fg_thresh, prominence_frac, can
     return np.array([[y, x] for y, x, h in kept])
 
 
+def estimate_merged_seeds(blob_mask, height_map, expected_count):
+    """
+    Last-resort fallback for a blob whose area implies more cells than any real
+    peak-finding (distance-transform or intensity) could distinguish -- e.g. a
+    tightly packed, uniformly saturated cluster where individual cells have
+    fully merged with no distinguishable local maximum left anywhere, not even
+    on the intensity surface. There's no peak left to find in that case, so
+    instead partition the blob's own pixels into expected_count roughly-equal
+    regions via k-means on pixel coordinates (this literally does "divide the
+    area into one-cell-sized pieces" -- see split_contours_watershed's
+    est_cell_area), then snap each region's seed to its own brightest/tallest
+    pixel so watershed still floods from a locally sensible starting point.
+    Positions from this path are approximate; the goal is only to recover the
+    right cell *count* for a box that's otherwise stuck at 1.
+    """
+    ys, xs = np.nonzero(blob_mask)
+    if expected_count >= len(xs):
+        expected_count = max(1, len(xs))
+    if expected_count <= 1:
+        idx = np.argmax(height_map[ys, xs])
+        return np.array([[ys[idx], xs[idx]]])
+    pts = np.column_stack([xs, ys]).astype(np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.5)
+    _, labels, _ = cv2.kmeans(pts, expected_count, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
+    labels = labels.flatten()
+    seeds = []
+    for k in range(expected_count):
+        sel = labels == k
+        if not sel.any():
+            continue
+        kys, kxs = ys[sel], xs[sel]
+        idx = np.argmax(height_map[kys, kxs])
+        seeds.append([kys[idx], kxs[idx]])
+    return np.array(seeds)
+
+
 def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_split_area,
                               min_peak_dist, prominence_frac=None, gray=None,
-                              use_intensity_peaks=False):
+                              use_intensity_peaks=False, est_cell_area=None):
     """
     Split touching/overlapping cells using a distance-transform watershed.
 
@@ -220,6 +256,11 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
                                      threshold_abs=fg_thresh * height_map.max(),
                                      labels=blob_mask)
 
+        if est_cell_area:
+            expected_count = max(1, round(area / est_cell_area))
+            if expected_count > len(coords):
+                coords = estimate_merged_seeds(blob_mask, height_map, expected_count)
+
         if len(coords) <= 1:
             # only one cell center found → single cell
             out.append((rc, None))
@@ -272,7 +313,8 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prom
                                             min_peak_dist=min_peak_dist,
                                             prominence_frac=prominence_frac,
                                             gray=gray,
-                                            use_intensity_peaks=args.watershed_use_intensity)
+                                            use_intensity_peaks=args.watershed_use_intensity,
+                                            est_cell_area=args.watershed_est_cell_area)
     else:
         cs, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contour_seed_pairs = [(c, None) for c in cs]
@@ -639,6 +681,21 @@ def main():
                          "geometrically present in the mask, but the original brightness "
                          "peaks of each cell can still be distinct even when the mask isn't. "
                          "Combine with --watershed_prominence_frac. Off by default.")
+    ap.add_argument("--watershed_est_cell_area", type=float, default=None,
+                    help="Typical area (px^2) of ONE cell. Last-resort fallback for blobs "
+                         "where even --watershed_use_intensity finds no distinguishable peak "
+                         "at all (confirmed on real footage: a big saturated multi-cell "
+                         "cluster with only 1 dot despite clearly containing several visible "
+                         "cells). When set, any blob whose area implies more cells than were "
+                         "actually found (round(blob_area / watershed_est_cell_area) > seeds "
+                         "found) is force-split into that many pieces by partitioning the "
+                         "blob's own pixels with k-means -- i.e. dividing the area into "
+                         "one-cell-sized chunks -- rather than leaving it as a single "
+                         "detection. Positions from this path are approximate (a geometric "
+                         "guess, not a real peak), so only use it to fix the count on boxes "
+                         "you've confirmed are merging multiple visible cells; get the area "
+                         "value from print_blob_size_diagnostics' median blob size, or measure "
+                         "one isolated cell directly. Default None = disabled.")
 
     ap.add_argument("--preview_frame_s", type=float, default=None,
                     help="Quick-check mode: instead of processing the whole video, grab the "
