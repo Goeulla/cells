@@ -90,7 +90,7 @@ def hungarian_match(tracks, detections, max_dist):
     return pairs, set(range(n_d)) - matched
 
 
-def find_seeds_prominence(dist, blob_mask, fg_thresh, prominence_frac, candidate_min_dist):
+def find_seeds_prominence(height_map, blob_mask, fg_thresh, prominence_frac, candidate_min_dist):
     """
     Seed-finding that separates two concerns min_peak_dist conflates: "is this a
     distinct peak at all" (candidate_min_dist, kept small) vs "is it tall enough
@@ -108,15 +108,23 @@ def find_seeds_prominence(dist, blob_mask, fg_thresh, prominence_frac, candidate
 
     Finds many close-together candidate peaks first (small candidate_min_dist),
     then greedily merges each into its nearest taller neighbor if the saddle
-    between them isn't deep enough (prominence < prominence_frac * dist.max()).
+    between them isn't deep enough (prominence < prominence_frac * height_map.max()).
+
+    height_map is usually the blob's distance transform (a geometric "how far from
+    the mask edge" surface), but can also be the raw grayscale image restricted to
+    the blob (masked-out pixels set below any real value) -- see use_intensity_peaks
+    on split_contours_watershed for why: MOG2's foreground confidence can saturate
+    uniformly across two overlapping bright cells even when their actual brightness
+    peaks, and the dimmer saddle between them, are still visible in the original
+    image. The mask's geometry alone can't recover a boundary that isn't there.
     """
-    coords = peak_local_max(dist, min_distance=max(1, int(candidate_min_dist)),
-                             threshold_abs=fg_thresh * dist.max(), labels=blob_mask)
+    coords = peak_local_max(height_map, min_distance=max(1, int(candidate_min_dist)),
+                             threshold_abs=fg_thresh * height_map.max(), labels=blob_mask)
     if len(coords) <= 1:
         return coords
-    heights = dist[coords[:, 0], coords[:, 1]]
+    heights = height_map[coords[:, 0], coords[:, 1]]
     order = np.argsort(-heights)  # tallest first
-    prominence_thresh = prominence_frac * dist.max()
+    prominence_thresh = prominence_frac * height_map.max()
 
     kept = []  # (y, x, h), tallest-first order preserved
     for idx in order:
@@ -125,9 +133,9 @@ def find_seeds_prominence(dist, blob_mask, fg_thresh, prominence_frac, candidate
         merged = False
         for ky, kx, kh in kept:
             n_samples = max(2, int(math.hypot(x - kx, y - ky)))
-            xs = np.clip(np.linspace(x, kx, n_samples).astype(int), 0, dist.shape[1] - 1)
-            ys = np.clip(np.linspace(y, ky, n_samples).astype(int), 0, dist.shape[0] - 1)
-            saddle = dist[ys, xs].min()
+            xs = np.clip(np.linspace(x, kx, n_samples).astype(int), 0, height_map.shape[1] - 1)
+            ys = np.clip(np.linspace(y, ky, n_samples).astype(int), 0, height_map.shape[0] - 1)
+            saddle = height_map[ys, xs].min()
             if h - saddle < prominence_thresh:
                 merged = True
                 break
@@ -137,12 +145,13 @@ def find_seeds_prominence(dist, blob_mask, fg_thresh, prominence_frac, candidate
 
 
 def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_split_area,
-                              min_peak_dist, prominence_frac=None):
+                              min_peak_dist, prominence_frac=None, gray=None,
+                              use_intensity_peaks=False):
     """
     Split touching/overlapping cells using a distance-transform watershed.
 
-    Seeds are the distance-transform local maxima (cell centers), found with
-    skimage.feature.peak_local_max so that two seeds separated by at least
+    Seeds are normally the distance-transform local maxima (cell centers), found
+    with skimage.feature.peak_local_max so that two seeds separated by at least
     min_peak_dist are always kept distinct (a plain dilation-based local-max
     test merges seeds that sit close together, which is exactly the touching-
     cell case this is meant to fix). Flooding uses skimage.segmentation.watershed
@@ -151,18 +160,33 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
     used here: its flooding order is driven by local gradient magnitude, which
     is nearly flat across a smooth distance-transform surface, so it produces
     essentially arbitrary (often massively lopsided) splits on this input.
+
+    use_intensity_peaks (needs gray) finds seeds from raw grayscale brightness
+    within the blob instead of the mask's distance transform. This matters
+    because the mask itself can be the actual bottleneck: MOG2's foreground
+    confidence can saturate uniformly across two overlapping bright cells even
+    though their real brightness peaks (and the dimmer saddle between them) are
+    still visible in the original image -- confirmed directly on real footage,
+    where a mask region for a 3+ cell cluster was one undifferentiated blob with
+    zero internal structure at any --mask_thresh, while intensity-based peaks on
+    the same region found 3 distinct, well-separated, near-saturated maxima. No
+    amount of geometric analysis of the mask shape can recover a boundary that
+    was already lost when the mask was thresholded. Watershed flooding still
+    uses -dist (not intensity) even in this mode, since distance transform
+    remains the right surface for drawing clean basin boundaries once seed
+    locations are known.
     """
     mask = binary_mask.copy()
     _, mask = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY)
     raw_contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Returns (contour, seed_xy) pairs. seed_xy is the exact distance-transform peak
-    # pixel for a split cell (the true, accurate cell center); None for a pass-through
-    # unsplit contour, where the caller should fall back to the contour's centroid
-    # (fine there since it's a single symmetric blob). Using the split *region*'s own
-    # centroid instead of its seed is wrong: an uneven/asymmetric split (very common
-    # for cells overlapping unevenly) produces a lopsided region whose centroid can
-    # land noticeably off the real cell, especially visible for close/touching pairs.
+    # Returns (contour, seed_xy) pairs. seed_xy is the exact peak pixel for a split
+    # cell (the true, accurate cell center); None for a pass-through unsplit contour,
+    # where the caller should fall back to the contour's centroid (fine there since
+    # it's a single symmetric blob). Using the split *region*'s own centroid instead
+    # of its seed is wrong: an uneven/asymmetric split (very common for cells
+    # overlapping unevenly) produces a lopsided region whose centroid can land
+    # noticeably off the real cell, especially visible for close/touching pairs.
     out = []
     for rc in raw_contours:
         area = cv2.contourArea(rc)
@@ -183,12 +207,17 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
             out.append((rc, None))
             continue
 
+        if use_intensity_peaks and gray is not None:
+            height_map = np.where(blob_mask > 0, gray.astype(np.float64), -1.0)
+        else:
+            height_map = dist
+
         if prominence_frac is not None:
-            coords = find_seeds_prominence(dist, blob_mask, fg_thresh, prominence_frac,
+            coords = find_seeds_prominence(height_map, blob_mask, fg_thresh, prominence_frac,
                                             candidate_min_dist=min_peak_dist)
         else:
-            coords = peak_local_max(dist, min_distance=max(1, int(min_peak_dist)),
-                                     threshold_abs=fg_thresh * dist.max(),
+            coords = peak_local_max(height_map, min_distance=max(1, int(min_peak_dist)),
+                                     threshold_abs=fg_thresh * height_map.max(),
                                      labels=blob_mask)
 
         if len(coords) <= 1:
@@ -241,7 +270,9 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prom
         contour_seed_pairs = split_contours_watershed(th, frame, fg_thresh, args.min_area,
                                             min_split_area=min_split,
                                             min_peak_dist=min_peak_dist,
-                                            prominence_frac=prominence_frac)
+                                            prominence_frac=prominence_frac,
+                                            gray=gray,
+                                            use_intensity_peaks=args.watershed_use_intensity)
     else:
         cs, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contour_seed_pairs = [(c, None) for c in cs]
@@ -598,6 +629,16 @@ def main():
                          "with --min_mean_intensity: this surfaces dark debris specks as "
                          "separate seeds that a coarser distance-only split used to silently "
                          "absorb into one blob. Default None = disabled (unchanged behavior).")
+    ap.add_argument("--watershed_use_intensity", action="store_true",
+                    help="Find split seeds from raw grayscale brightness within each blob "
+                         "instead of the mask's distance transform. Use when a whole cluster "
+                         "of cells has fused into one undifferentiated mask blob with no "
+                         "internal shape structure at all (confirmed on real footage: no "
+                         "--mask_thresh recovers a gap once this happens) -- distance-based "
+                         "splitting, prominence or not, cannot find a boundary that isn't "
+                         "geometrically present in the mask, but the original brightness "
+                         "peaks of each cell can still be distinct even when the mask isn't. "
+                         "Combine with --watershed_prominence_frac. Off by default.")
 
     ap.add_argument("--preview_frame_s", type=float, default=None,
                     help="Quick-check mode: instead of processing the whole video, grab the "
