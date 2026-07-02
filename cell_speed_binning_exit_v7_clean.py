@@ -324,17 +324,20 @@ def save_crossing_contact_sheet(video_path, per_rows, fps, out_path, crop=80, ma
 
     # cv2's frame-index seeking (CAP_PROP_POS_FRAMES) is unreliable on many
     # compressed formats -- it can land near the nearest keyframe rather than the
-    # exact requested frame, silently cropping the wrong moment (showing no cell at
-    # all if it's since moved on). Seek once to a safe point well before the
-    # earliest needed frame, then advance with sequential reads only (always
-    # frame-accurate, tracked with an explicit counter) instead of re-seeking once
-    # per thumbnail.
+    # exact requested frame, silently cropping the wrong moment. An earlier version
+    # of this function still seeked once to a "safe" starting point before reading
+    # sequentially, trusting that seek to be accurate -- but if that one seek is off,
+    # every frame index after it is offset by the same amount, silently misaligning
+    # every thumbnail in the whole sheet at once (confirmed: a contact sheet built
+    # this way had zero correctly-aligned thumbnails, while frames read sequentially
+    # from frame 0 with no seek at all were correct). So: no seeking at all, ever --
+    # always read sequentially from frame 0, which is the only guaranteed-accurate
+    # starting point regardless of codec/keyframe interval.
     needed = sorted({int(round(row["time_exit_s_abs"] * fps)) for row in per_rows})
-    seek_to = max(0, needed[0] - int(5 * fps))
-    cap2.set(cv2.CAP_PROP_POS_FRAMES, seek_to)
+    cap2.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     frame_by_idx = {}
-    cur, ni = seek_to, 0
+    cur, ni = 0, 0
     while ni < len(needed):
         ret, frame = cap2.read()
         if not ret:
@@ -356,14 +359,26 @@ def save_crossing_contact_sheet(video_path, per_rows, fps, out_path, crop=80, ma
         H, W = frame.shape[:2]
         x, y = int(row["x_exit"]), int(row["y_exit"])
         half = crop // 2
-        x0, x1 = max(0, x - half), min(W, x + half)
-        y0, y1 = max(0, y - half), min(H, y + half)
-        thumb = frame[y0:y1, x0:x1]
-        if thumb.size == 0:
+        # Crop at a fixed window [x-half, x+half) x [y-half, y+half) around the true
+        # position and paste onto a crop x crop canvas at 1:1 scale -- do NOT resize
+        # an edge-clipped (asymmetric) crop back up to a fixed size, since that
+        # stretches the image and silently shifts where the true position actually
+        # lands relative to a marker drawn at a fixed center. Every exit near a frame
+        # boundary (which is all of them here, since e.g. exit_side=top means y_exit
+        # is always small) would otherwise be systematically misaligned. Anything
+        # outside the frame is just left black.
+        x0, x1 = x - half, x + half
+        y0, y1 = y - half, y + half
+        src_x0, src_x1 = max(0, x0), min(W, x1)
+        src_y0, src_y1 = max(0, y0), min(H, y1)
+        if src_x1 <= src_x0 or src_y1 <= src_y0:
             n_missing += 1
             continue
-        thumb = cv2.resize(thumb, (crop, crop))
-        cv2.circle(thumb, (crop // 2, crop // 2), 3, (0, 255, 0), 1)
+        thumb = np.zeros((crop, crop, 3), dtype=np.uint8)
+        dst_x0, dst_y0 = src_x0 - x0, src_y0 - y0
+        dst_x1, dst_y1 = dst_x0 + (src_x1 - src_x0), dst_y0 + (src_y1 - src_y0)
+        thumb[dst_y0:dst_y1, dst_x0:dst_x1] = frame[src_y0:src_y1, src_x0:src_x1]
+        cv2.circle(thumb, (half, half), 3, (0, 255, 0), 1)
         counted_as = row.get("counted_as", "speedbin")
         # yellow = counted in a speed bin (part of total_counted); orange = only in
         # total_cells via short_track/streak_only_short -- the ones most worth a
