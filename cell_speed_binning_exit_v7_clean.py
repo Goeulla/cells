@@ -222,7 +222,8 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
     return out
 
 
-def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prominence_frac=None):
+def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prominence_frac=None,
+                  raw_diff=None):
     """
     Mask -> contours -> filtered (cx, cy, is_streak) detections. Shared by the
     real per-frame loop and the quick preview/sweep path so both always see
@@ -267,6 +268,15 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prom
                 continue
             cx = int(M["m10"] / M["m00"])
             cy = int(M["m01"] / M["m00"])
+        if args.min_local_motion > 0 and raw_diff is not None:
+            r = 4
+            local = raw_diff[max(0, cy-r):cy+r, max(0, cx-r):cx+r]
+            if local.size == 0 or local.mean() < args.min_local_motion:
+                # No real frame-to-frame change here -- a MOG2 "ghost" (something,
+                # often debris, was recently here but has already moved on; the mask
+                # still flags it from residual variance even though current pixels
+                # look like ordinary background) rather than a currently-present cell.
+                continue
         x, y, w, h = cv2.boundingRect(c)
         long_axis  = float(max(w, h))
         short_axis = float(max(1, min(w, h)))
@@ -313,7 +323,7 @@ def print_blob_size_diagnostics(th, args):
           f"already touching pairs, and down if there's a lot of small debris)\n")
 
 
-def save_preview(th, frame, gray, args):
+def save_preview(th, frame, gray, args, raw_diff=None):
     """
     Annotate one already-computed frame/mask with detected cell counts and
     save it, instead of writing a full-video debug file. If --sweep_fg_thresh
@@ -360,7 +370,7 @@ def save_preview(th, frame, gray, args):
         tiles = []
         for fg in fg_list:
             _, detections, _ = detect_cells(th, frame, gray, args, fg_thresh=fg,
-                                             **make_kwargs(row_val))
+                                             raw_diff=raw_diff, **make_kwargs(row_val))
             print(f"{fg:>10.2f} {row_val:>16.2f} {len(detections):>6}")
             tile = frame.copy()
             for i, (cx, cy, _is_streak) in enumerate(detections):
@@ -503,6 +513,14 @@ def main():
                          "cells, debris, dead cells) are discarded before tracking. "
                          "Default 0 = no filtering. Use --preview_frame_s to check a value "
                          "against a real frame before committing to a full run.")
+    ap.add_argument("--min_local_motion", type=float, default=0.0,
+                    help="Minimum mean frame-to-frame pixel difference (0-255) in a small "
+                         "window around a detected cell's position for it to count. Rejects "
+                         "MOG2 'ghosts': a spot flagged as foreground because something "
+                         "(often debris) was recently there but has since moved on -- current "
+                         "pixels there look like ordinary background, so --min_mean_intensity "
+                         "can't catch it, but checking actual current motion can. Default 0 "
+                         "= no filtering. Try ~3-5 if you confirm ghosts via --preview_frame_s.")
 
     ap.add_argument("--mog2_history",      type=int,   default=500)
     ap.add_argument("--mog2_varThreshold", type=float, default=16)
@@ -824,10 +842,17 @@ def main():
         fg = backsub.apply(gray, learningRate=float(args.learning_rate))
         _, th_mog2 = cv2.threshold(fg, args.mask_thresh, 255, cv2.THRESH_BINARY)
 
+        # Raw frame-to-frame diff, kept separate from --use_framediff's mask-combination
+        # role: used by --min_local_motion to reject detections with no current motion.
+        # A MOG2 "ghost" -- a real region flagged as foreground because something (often
+        # debris) was recently there, even though it has since moved on -- has ordinary
+        # background-level intensity by the time it's detected, so --min_mean_intensity
+        # can't catch it; only checking actual frame-to-frame change can.
+        raw_diff = cv2.absdiff(gray, prev_gray) if prev_gray is not None else None
+
         th_diff = None
-        if args.use_framediff and prev_gray is not None:
-            diff = cv2.absdiff(gray, prev_gray)
-            _, th_diff = cv2.threshold(diff, args.diff_thresh, 255, cv2.THRESH_BINARY)
+        if args.use_framediff and raw_diff is not None:
+            _, th_diff = cv2.threshold(raw_diff, args.diff_thresh, 255, cv2.THRESH_BINARY)
             if args.diff_close_iter > 0:
                 th_diff = cv2.morphologyEx(th_diff, cv2.MORPH_CLOSE,
                                            np.ones((3,3),np.uint8),
@@ -883,12 +908,12 @@ def main():
             th = cv2.bitwise_and(th, cv2.bitwise_not(edges))
 
         if args.preview_frame_s is not None and (cur_frame / fps - start_s) >= args.preview_frame_s:
-            save_preview(th, frame, gray, args)
+            save_preview(th, frame, gray, args, raw_diff)
             cap.release()
             if vw: vw.release()
             return
 
-        contours, detections, det_boxes = detect_cells(th, frame, gray, args)
+        contours, detections, det_boxes = detect_cells(th, frame, gray, args, raw_diff=raw_diff)
 
         for tid in tracks:
             tracks[tid]["updated"] = False
