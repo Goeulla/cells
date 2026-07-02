@@ -338,6 +338,17 @@ def save_preview(th, frame, gray, args, raw_diff=None):
     """
     print_blob_size_diagnostics(th, args)
 
+    # Save the exact, untouched frame this preview was built from, from the same
+    # in-memory frame object used for detection -- so a raw-vs-detected comparison
+    # is guaranteed pixel-identical instead of relying on separately re-deriving
+    # which frame index to re-extract (which has repeatedly gone wrong: off-by-one
+    # errors between a manual reproduction's target-frame math and this tool's
+    # actual >=-based trigger condition).
+    raw_out = args.preview_out.rsplit(".", 1)
+    raw_out = f"{raw_out[0]}_raw.{raw_out[1]}" if len(raw_out) == 2 else args.preview_out + "_raw"
+    cv2.imwrite(raw_out, frame)
+    print(f"Wrote: {raw_out}  (raw frame, no annotations, for direct before/after comparison)")
+
     if not args.use_watershed_split and (args.sweep_fg_thresh or args.sweep_min_peak_dist
                                           or args.sweep_prominence_frac):
         print("Note: --sweep_fg_thresh/--sweep_min_peak_dist/--sweep_prominence_frac only "
