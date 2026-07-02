@@ -519,8 +519,15 @@ def main():
                          "MOG2 'ghosts': a spot flagged as foreground because something "
                          "(often debris) was recently there but has since moved on -- current "
                          "pixels there look like ordinary background, so --min_mean_intensity "
-                         "can't catch it, but checking actual current motion can. Default 0 "
-                         "= no filtering. Try ~3-5 if you confirm ghosts via --preview_frame_s.")
+                         "can't catch it. CAUTION: confirmed via direct multi-frame check to "
+                         "also reject real, slow-moving cells -- a genuinely present, moving "
+                         "cell can still have near-zero displacement between one particular "
+                         "pair of adjacent frames just by chance, and one frame-pair's "
+                         "instantaneous diff can't tell that apart from a truly static ghost. "
+                         "Do not use this if slow-moving cells are part of what you're trying "
+                         "to detect (e.g. distinguishing free-flow vs. adhesion-interacted "
+                         "cells by speed) -- it will bias against exactly that population. "
+                         "Default 0 = no filtering, recommended.")
 
     ap.add_argument("--mog2_history",      type=int,   default=500)
     ap.add_argument("--mog2_varThreshold", type=float, default=16)
