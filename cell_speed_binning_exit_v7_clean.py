@@ -303,7 +303,7 @@ def save_preview(th, frame, gray, args):
     print(f"Wrote: {args.preview_out}  ({len(pd_list)}x{len(fg_list)} grid)")
 
 
-def save_crossing_contact_sheet(video_path, per_rows, fps, out_path, crop=80, max_cols=12):
+def save_crossing_contact_sheet(video_path, per_rows, fps, out_path, crop=120, max_cols=10):
     """
     One small thumbnail per counted cell, cropped from the real frame at the
     moment it was counted (time_exit_s_abs/x_exit/y_exit from per_rows) and
@@ -384,8 +384,13 @@ def save_crossing_contact_sheet(video_path, per_rows, fps, out_path, crop=80, ma
         # total_cells via short_track/streak_only_short -- the ones most worth a
         # second look, since they were only tracked a frame or two.
         color = (0, 255, 255) if counted_as == "speedbin" else (0, 140, 255)
-        label = f"{row['track_id']} {row['final_reason'][:4]}"
-        cv2.putText(thumb, label, (2, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+        # Exact timestamp + position printed on every thumbnail so this can be checked
+        # against the original video independently, in any ordinary video player, with
+        # no dependency on this tool's own cropping/rendering being correct.
+        label1 = f"id{row['track_id']} {row['final_reason'][:4]}"
+        label2 = f"t={row['time_exit_s_abs']:.3f}s ({x},{y})"
+        cv2.putText(thumb, label1, (2, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+        cv2.putText(thumb, label2, (2, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
         thumbs.append(thumb)
     if n_missing:
         print(f"Note: {n_missing} row(s) could not be re-extracted.")
