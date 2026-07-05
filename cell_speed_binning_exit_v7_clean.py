@@ -422,6 +422,15 @@ def save_preview(th, frame, gray, args, raw_diff=None):
     cv2.imwrite(raw_out, frame)
     print(f"Wrote: {raw_out}  (raw frame, no annotations, for direct before/after comparison)")
 
+    # Same idea as _raw above, but for the actual binary foreground mask -- lets
+    # you tell apart "MOG2 never flagged this object as foreground at all" (not
+    # in this image either) from "it was in the mask but got filtered/merged
+    # away downstream" (visible here, missing from the annotated output).
+    mask_out = args.preview_out.rsplit(".", 1)
+    mask_out = f"{mask_out[0]}_mask.{mask_out[1]}" if len(mask_out) == 2 else args.preview_out + "_mask"
+    cv2.imwrite(mask_out, th)
+    print(f"Wrote: {mask_out}  (binary foreground mask, same frame)")
+
     if not args.use_watershed_split and (args.sweep_fg_thresh or args.sweep_min_peak_dist
                                           or args.sweep_prominence_frac):
         print("Note: --sweep_fg_thresh/--sweep_min_peak_dist/--sweep_prominence_frac only "
