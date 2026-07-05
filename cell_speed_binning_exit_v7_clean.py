@@ -604,8 +604,15 @@ def main():
                     help="Minimum mean grayscale intensity (0-255) inside a detected blob "
                          "for it to be counted as a cell. Blobs darker than this ('black' "
                          "cells, debris, dead cells) are discarded before tracking. "
-                         "Default 0 = no filtering. Use --preview_frame_s to check a value "
-                         "against a real frame before committing to a full run.")
+                         "Default 0 = no filtering. Checked on real footage and deliberately "
+                         "left off: confirmed solid dark halo-less blobs (debris/stuck "
+                         "objects) do get counted, but a threshold strong enough to exclude "
+                         "them also caught ~40% of all detections in the same dense frame, "
+                         "most of which looked like faint/dim real detections rather than "
+                         "debris -- same false-negative risk as --min_local_motion below, and "
+                         "not worth it given this assay specifically cares about slower/dimmer "
+                         "cells. Use --preview_frame_s to check a value against a real frame "
+                         "before committing to a full run if you want to revisit this.")
     ap.add_argument("--min_local_motion", type=float, default=0.0,
                     help="Minimum mean frame-to-frame pixel difference (0-255) in a small "
                          "window around a detected cell's position for it to count. Rejects "
@@ -658,15 +665,17 @@ def main():
                     help="Only attempt watershed on blobs larger than this area (px²). "
                          "Blobs smaller than this are treated as single cells and skipped. "
                          "Default: 1.8 * min_area. Set to ~1.5x typical single-cell area.")
-    ap.add_argument("--watershed_min_peak_dist", type=float, default=None,
+    ap.add_argument("--watershed_min_peak_dist", type=float, default=4.0,
                     help="Minimum distance (px) between two cell-center seeds for them to "
                          "be split into separate cells. Two touching cells closer together "
-                         "than this are kept as one. Default: radius of a single cell, "
-                         "estimated as sqrt(min_split_area / (2*pi)). When "
-                         "--watershed_prominence_frac is set, this becomes the initial "
-                         "candidate-peak spacing instead (can be set much smaller, e.g. 4-5, "
-                         "since prominence handles rejecting noise instead).")
-    ap.add_argument("--watershed_prominence_frac", type=float, default=None,
+                         "than this are kept as one. Default 4: the candidate-peak spacing "
+                         "confirmed on real footage together with --watershed_prominence_frac "
+                         "0.25 (also the default), which handles rejecting noise so this can "
+                         "stay small. Pass 0 to fall back to the old radius-based auto-derive "
+                         "(sqrt(min_split_area / (2*pi))) instead, which was never validated "
+                         "against real footage and produced a much smaller (more aggressive, "
+                         "untested) value in practice.")
+    ap.add_argument("--watershed_prominence_frac", type=float, default=0.25,
                     help="Enables prominence-based seed filtering instead of pure distance: "
                          "a candidate peak is kept only if it stands at least this fraction "
                          "of the blob's own max distance-transform value above the saddle "
@@ -676,10 +685,9 @@ def main():
                          "centers are closer together than --watershed_min_peak_dist can "
                          "still be split correctly -- which plain distance-based filtering "
                          "can never do (mechanically impossible once a cluster's own extent "
-                         "is smaller than min_peak_dist). Try 0.15-0.25. Recommended to pair "
-                         "with --min_mean_intensity: this surfaces dark debris specks as "
-                         "separate seeds that a coarser distance-only split used to silently "
-                         "absorb into one blob. Default None = disabled (unchanged behavior).")
+                         "is smaller than min_peak_dist). Default 0.25, confirmed on real "
+                         "footage together with --watershed_fg_thresh 0.7 (also the default) "
+                         "as a good split setting for this assay.")
     ap.add_argument("--watershed_use_intensity", action="store_true",
                     help="Find split seeds from raw grayscale brightness within each blob "
                          "instead of the mask's distance transform. Use when a whole cluster "
