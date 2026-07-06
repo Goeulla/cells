@@ -180,9 +180,38 @@ def estimate_merged_seeds(blob_mask, height_map, expected_count):
     return np.array(seeds)
 
 
+def find_outer_contours(mask, want_hole_flag=False):
+    """
+    cv2.findContours with RETR_EXTERNAL, optionally also reporting whether each
+    outer contour has an internal hole (a child contour in RETR_CCOMP's
+    hierarchy). A hole means the mask is a ring/donut, not a filled disk --
+    confirmed on real footage to happen for cells whose interior is dark enough
+    to be indistinguishable from the learned MOG2 background (only the bright
+    halo rim deviates enough to be flagged foreground), unlike ordinary live
+    cells whose whole body reads as foreground. Used to identify that subset
+    without a brightness threshold, which swept up far too many normal (dim)
+    detections when tried (see --exclude_hole_blobs).
+    """
+    if not want_hole_flag:
+        cs, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return [(c, False) for c in cs]
+    cs, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return []
+    hierarchy = hierarchy[0]
+    out = []
+    for i, c in enumerate(cs):
+        _, _, child, parent = hierarchy[i]
+        if parent != -1:
+            continue  # this is a hole itself, not a blob -- skip, its parent covers it
+        out.append((c, child != -1))
+    return out
+
+
 def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_split_area,
                               min_peak_dist, prominence_frac=None, gray=None,
-                              use_intensity_peaks=False, est_cell_area=None):
+                              use_intensity_peaks=False, est_cell_area=None,
+                              exclude_hole_blobs=False):
     """
     Split touching/overlapping cells using a distance-transform watershed.
 
@@ -214,7 +243,7 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
     """
     mask = binary_mask.copy()
     _, mask = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY)
-    raw_contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    raw_contours = find_outer_contours(mask, want_hole_flag=exclude_hole_blobs)
 
     # Returns (contour, seed_xy) pairs. seed_xy is the exact peak pixel for a split
     # cell (the true, accurate cell center); None for a pass-through unsplit contour,
@@ -224,14 +253,22 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
     # overlapping unevenly) produces a lopsided region whose centroid can land
     # noticeably off the real cell, especially visible for close/touching pairs.
     out = []
-    for rc in raw_contours:
+    for rc, has_hole in raw_contours:
         area = cv2.contourArea(rc)
         if area < min_area:
             continue
+        # A hole only marks a single dead cell if the blob stays a single,
+        # unsplit object below -- gating it here instead of skipping the whole
+        # blob upfront matters because several live cells clustered around an
+        # incidental gap can also produce a mask with a hole, and splitting
+        # would still correctly recover them as separate real cells. Excluding
+        # upfront would silently drop that whole cluster instead.
+        skip_if_unsplit = exclude_hole_blobs and has_hole
 
         # small blobs → single cell, skip splitting
         if area < min_split_area:
-            out.append((rc, None))
+            if not skip_if_unsplit:
+                out.append((rc, None))
             continue
 
         # isolate blob
@@ -240,7 +277,8 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
 
         dist = cv2.distanceTransform(blob_mask, cv2.DIST_L2, 5)
         if dist.max() <= 0:
-            out.append((rc, None))
+            if not skip_if_unsplit:
+                out.append((rc, None))
             continue
 
         if use_intensity_peaks and gray is not None:
@@ -263,7 +301,8 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
 
         if len(coords) <= 1:
             # only one cell center found → single cell
-            out.append((rc, None))
+            if not skip_if_unsplit:
+                out.append((rc, None))
             continue
 
         peak_mask = np.zeros(dist.shape, dtype=bool)
@@ -286,7 +325,7 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
                     out.append((c, label_to_seed.get(label)))
                     split_any = True
 
-        if not split_any:
+        if not split_any and not skip_if_unsplit:
             out.append((rc, None))
 
     return out
@@ -314,10 +353,12 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prom
                                             prominence_frac=prominence_frac,
                                             gray=gray,
                                             use_intensity_peaks=args.watershed_use_intensity,
-                                            est_cell_area=args.watershed_est_cell_area)
+                                            est_cell_area=args.watershed_est_cell_area,
+                                            exclude_hole_blobs=args.exclude_hole_blobs)
     else:
-        cs, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contour_seed_pairs = [(c, None) for c in cs]
+        cs_holes = find_outer_contours(th, want_hole_flag=args.exclude_hole_blobs)
+        contour_seed_pairs = [(c, None) for c, has_hole in cs_holes
+                               if not (args.exclude_hole_blobs and has_hole)]
 
     detections = []
     det_boxes  = []
@@ -613,6 +654,18 @@ def main():
                          "not worth it given this assay specifically cares about slower/dimmer "
                          "cells. Use --preview_frame_s to check a value against a real frame "
                          "before committing to a full run if you want to revisit this.")
+    ap.add_argument("--exclude_hole_blobs", action="store_true",
+                    help="Exclude blobs whose foreground mask has a hole (a donut/ring shape: "
+                         "solid bright rim, unflagged interior) instead of being a filled disk. "
+                         "Confirmed on real footage: MOG2 flags only the bright halo rim of "
+                         "certain cells as foreground -- their interior is dark enough to be "
+                         "indistinguishable from the learned background -- leaving a literal "
+                         "hole in the mask. Unlike --min_mean_intensity (a brightness cutoff "
+                         "that swept up too many real dim cells), this is a shape/topology "
+                         "check: confirmed to flag only a small minority of blobs in a sample "
+                         "frame (3 of 79), all visually dark-centered/bright-haloed. Off by "
+                         "default -- test with --preview_frame_s first to confirm it isn't "
+                         "also catching real cells in your footage before using it on a full run.")
     ap.add_argument("--min_local_motion", type=float, default=0.0,
                     help="Minimum mean frame-to-frame pixel difference (0-255) in a small "
                          "window around a detected cell's position for it to count. Rejects "
