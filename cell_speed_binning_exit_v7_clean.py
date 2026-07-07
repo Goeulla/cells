@@ -335,6 +335,33 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
     return out
 
 
+def local_blob_is_blurry(gray, cx, cy, radius, max_sharpness):
+    """
+    Dead-cell signature confirmed directly against user-labeled examples (t=280s,
+    detections 143/13/17/43/113/118/34): unlike the sharp, high-contrast
+    bright-halo ring of a live cell, these show up as a soft, blurred, halo-less
+    dark blob -- consistent with them sitting outside the imaging focal plane
+    (e.g. settled to the channel floor) rather than flowing through it in focus.
+    Measured as Laplacian variance (a standard focus/blur metric) in a small
+    patch around the detection center: low variance = few sharp edges = blurry.
+    Replaces an earlier mask-hole-based guess that the user directly confirmed
+    was wrong (none of the 7 labeled examples had a mask hole) -- this one was
+    verified instead: tight-radius Laplacian variance put 6 of the 7 in the
+    bottom ~20% of the whole frame's detections, and the 7th (contaminated by a
+    touching bright neighbor at the tested radius) still visually matches.
+    Requires the patch to be reasonably centered in-frame: a patch clipped by
+    the image border reads as artificially uniform/low-variance too (confirmed
+    to produce exactly this false signal for two detections sitting right at
+    the frame edge), which would wrongly flag real edge-of-frame cells.
+    """
+    y0, y1 = cy - radius, cy + radius
+    x0, x1 = cx - radius, cx + radius
+    if y0 < 0 or x0 < 0 or y1 > gray.shape[0] or x1 > gray.shape[1]:
+        return False
+    patch = gray[y0:y1, x0:x1].astype(np.float64)
+    return cv2.Laplacian(patch, cv2.CV_64F).var() < max_sharpness
+
+
 def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prominence_frac=None,
                   raw_diff=None):
     """
@@ -364,9 +391,19 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prom
         contour_seed_pairs = [(c, None, has_hole) for c, has_hole in cs_holes
                                if not (args.exclude_hole_blobs and has_hole)]
 
+    # gray is Gaussian-blurred upstream (for MOG2/mask purposes) -- that smoothing
+    # destroys exactly the high-frequency edge content the blur/sharpness dead-cell
+    # signal depends on (confirmed: measuring on the blurred gray reads almost
+    # every detection as "blurry", not just the true dead cells). Recompute an
+    # unblurred grayscale from the raw frame instead, once per call, only when
+    # actually needed.
+    sharp_gray = None
+    if args.dead_cell_max_sharpness is not None:
+        sharp_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
     detections = []
     det_boxes  = []
-    for c, seed, is_hole in contour_seed_pairs:
+    for c, seed, _has_hole in contour_seed_pairs:
         area = cv2.contourArea(c)
         if area < args.min_area or area > args.max_area:
             continue
@@ -402,8 +439,12 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prom
                       and area >= args.streak_min_area
                       and long_axis >= args.streak_min_len
                       and long_axis/short_axis >= args.streak_ar)
-        detections.append((cx, cy, is_streak, is_hole))
-        det_boxes.append((x, y, w, h, is_streak, is_hole))
+        is_dead = False
+        if sharp_gray is not None:
+            is_dead = local_blob_is_blurry(sharp_gray, cx, cy, args.dead_cell_sharpness_radius,
+                                            args.dead_cell_max_sharpness)
+        detections.append((cx, cy, is_streak, is_dead))
+        det_boxes.append((x, y, w, h, is_streak, is_dead))
     return [c for c, _, _ in contour_seed_pairs], detections, det_boxes
 
 
@@ -511,8 +552,8 @@ def save_preview(th, frame, gray, args, raw_diff=None):
                                              raw_diff=raw_diff, **make_kwargs(row_val))
             print(f"{fg:>10.2f} {row_val:>16.2f} {len(detections):>6}")
             tile = frame.copy()
-            for i, (cx, cy, _is_streak, is_hole) in enumerate(detections):
-                col = (0, 0, 255) if is_hole else (0, 255, 0)
+            for i, (cx, cy, _is_streak, is_dead) in enumerate(detections):
+                col = (0, 0, 255) if is_dead else (0, 255, 0)
                 cv2.circle(tile, (cx, cy), 3, col, -1)
                 cv2.putText(tile, str(i + 1), (cx + 4, cy - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
@@ -662,15 +703,41 @@ def main():
     ap.add_argument("--exclude_hole_blobs", action="store_true",
                     help="Exclude blobs whose foreground mask has a hole (a donut/ring shape: "
                          "solid bright rim, unflagged interior) instead of being a filled disk. "
-                         "Confirmed on real footage: MOG2 flags only the bright halo rim of "
-                         "certain cells as foreground -- their interior is dark enough to be "
-                         "indistinguishable from the learned background -- leaving a literal "
-                         "hole in the mask. Unlike --min_mean_intensity (a brightness cutoff "
-                         "that swept up too many real dim cells), this is a shape/topology "
-                         "check: confirmed to flag only a small minority of blobs in a sample "
-                         "frame (3 of 79), all visually dark-centered/bright-haloed. Off by "
-                         "default -- test with --preview_frame_s first to confirm it isn't "
-                         "also catching real cells in your footage before using it on a full run.")
+                         "NOTE: this was originally built as a dead-cell detector but the user "
+                         "directly confirmed on real labeled examples that it's wrong for that -- "
+                         "none of 7 user-identified dead cells at t=280s had a mask hole. Kept as "
+                         "a narrow, independent shape/topology filter (still legitimately finds "
+                         "blobs with an unflagged interior), just no longer tied to dead-cell "
+                         "classification. See --dead_cell_max_sharpness for the actual dead-cell "
+                         "signal. Off by default.")
+    ap.add_argument("--dead_cell_max_sharpness", type=float, default=None,
+                    help="Tag a detection as a dead cell if the Laplacian variance (a standard "
+                         "focus/blur metric), measured on the raw unblurred frame (not the "
+                         "Gaussian-smoothed gray used for MOG2 -- that smoothing was confirmed to "
+                         "wash out this signal almost entirely, reading nearly everything as "
+                         "'blurry'), in a small patch around its center is below this value. "
+                         "Confirmed directly against 7 user-labeled dead cells (t=280s): unlike a "
+                         "live cell's sharp, high-contrast bright-halo ring, these show as a soft, "
+                         "blurred, halo-less dark blob -- consistent with sitting outside the "
+                         "imaging focal plane rather than flowing through it. At "
+                         "--dead_cell_sharpness_radius 8 and threshold 550, 6 of 7 are tagged "
+                         "(the 7th sits touching a bright neighbor within that radius, which "
+                         "inflates its score, but still visually matches); checking other "
+                         "low-scoring detections beyond those 7 at this threshold (19 of 184 total) "
+                         "found the same visual phenotype, not false positives -- try 550 as a "
+                         "starting point for this footage. Tags only (see is_dead_cell in "
+                         "--per_object_csv and dead_cell_count in --out_csv); does not exclude "
+                         "anything from the count. Default None = disabled (no tagging happens, "
+                         "is_dead_cell always False). Verify with --preview_frame_s before trusting "
+                         "it on new footage: a patch clipped by the image border reads as falsely "
+                         "blurry, though this is already guarded against (edge-touching detections "
+                         "are never tagged).")
+    ap.add_argument("--dead_cell_sharpness_radius", type=int, default=8,
+                    help="Patch half-size (px) for --dead_cell_max_sharpness's Laplacian variance "
+                         "measurement. Default 8, matched to this footage's cell size -- a patch "
+                         "much smaller than one cell mixes in background noise, much larger mixes "
+                         "in neighboring cells (confirmed to inflate the score and mask the "
+                         "signal on a cell sitting next to a bright neighbor).")
     ap.add_argument("--min_local_motion", type=float, default=0.0,
                     help="Minimum mean frame-to-frame pixel difference (0-255) in a small "
                          "window around a detected cell's position for it to count. Rejects "
@@ -999,9 +1066,9 @@ def main():
             bucket[tb] += 1
             counted_as = "streak_only_short" if st["is_streak"] else "short_track"
         # Majority vote across the track's own lifetime, not just its last frame --
-        # a cell that showed the dead-cell hole signature (see --exclude_hole_blobs)
-        # in most of the frames it was seen in is classified as a dead cell here,
-        # tagged alongside (not instead of) its speed-bin/streak/short bucket above,
+        # a cell that measured as blurry (see --dead_cell_max_sharpness) in most
+        # of the frames it was seen in is classified as a dead cell here, tagged
+        # alongside (not instead of) its speed-bin/streak/short bucket above,
         # since live/dead is a separate dimension from how it was counted.
         is_dead_cell = st["dead_count"] * 2 >= st["seen_count"]
         if is_dead_cell:
@@ -1122,7 +1189,7 @@ def main():
         pairs, unmatched = hungarian_match(tracks, detections, args.max_dist)
 
         for tid, j in pairs:
-            cx, cy, is_streak, is_hole = detections[j]
+            cx, cy, is_streak, is_dead = detections[j]
             st = tracks[tid]
             st["cx"], st["cy"] = cx, cy
             st["last_seen_frame"] = cur_frame
@@ -1130,11 +1197,11 @@ def main():
             st["missed_count"] = 0
             st["updated"]      = True
             st["is_streak"]    = st["is_streak"] or is_streak
-            st["dead_count"]  += 1 if is_hole else 0
+            st["dead_count"]  += 1 if is_dead else 0
             st["end_x"], st["end_y"] = cx, cy
 
         for j in unmatched:
-            cx, cy, is_streak, is_hole = detections[j]
+            cx, cy, is_streak, is_dead = detections[j]
             if args.enable_streak and is_streak:
                 while (recent_streaks
                        and cur_frame - recent_streaks[0][0] > args.streak_merge_window):
@@ -1146,7 +1213,7 @@ def main():
             tracks[next_id] = dict(
                 cx=cx, cy=cy, first_frame=cur_frame, last_seen_frame=cur_frame,
                 seen_count=1, missed_count=0, is_streak=bool(is_streak),
-                dead_count=1 if is_hole else 0,
+                dead_count=1 if is_dead else 0,
                 updated=True, start_x=cx, start_y=cy, end_x=cx, end_y=cy)
             next_id += 1
 
@@ -1192,8 +1259,8 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX,0.45,(255,255,255),1)
 
             if args.draw_detections:
-                for (x,y,w,h,is_s,is_hole) in det_boxes:
-                    col = (0,0,255) if is_hole else ((0,255,255) if is_s else (255,0,255))
+                for (x,y,w,h,is_s,is_dead) in det_boxes:
+                    col = (0,0,255) if is_dead else ((0,255,255) if is_s else (255,0,255))
                     cv2.rectangle(left,(x,y),(x+w,y+h),col,1)
 
             for tid,st in tracks.items():
