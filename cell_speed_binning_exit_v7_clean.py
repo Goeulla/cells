@@ -61,7 +61,7 @@ def hungarian_match(tracks, detections, max_dist):
         for tid in tids:
             st = tracks[tid]
             best_j, best_d = None, 1e9
-            for j, (cx, cy, _) in enumerate(detections):
+            for j, (cx, cy, *_rest) in enumerate(detections):
                 if j in used:
                     continue
                 d = math.hypot(cx - st["cx"], cy - st["cy"])
@@ -76,7 +76,7 @@ def hungarian_match(tracks, detections, max_dist):
     cost = np.full((n_t, n_d), INF, dtype=np.float64)
     for i, tid in enumerate(tids):
         st = tracks[tid]
-        for j, (cx, cy, _) in enumerate(detections):
+        for j, (cx, cy, *_rest) in enumerate(detections):
             d = math.hypot(cx - st["cx"], cy - st["cy"])
             if d <= max_dist:
                 cost[i, j] = d
@@ -243,7 +243,7 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
     """
     mask = binary_mask.copy()
     _, mask = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY)
-    raw_contours = find_outer_contours(mask, want_hole_flag=exclude_hole_blobs)
+    raw_contours = find_outer_contours(mask, want_hole_flag=True)
 
     # Returns (contour, seed_xy) pairs. seed_xy is the exact peak pixel for a split
     # cell (the true, accurate cell center); None for a pass-through unsplit contour,
@@ -258,17 +258,19 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
         if area < min_area:
             continue
         # A hole only marks a single dead cell if the blob stays a single,
-        # unsplit object below -- gating it here instead of skipping the whole
-        # blob upfront matters because several live cells clustered around an
-        # incidental gap can also produce a mask with a hole, and splitting
-        # would still correctly recover them as separate real cells. Excluding
-        # upfront would silently drop that whole cluster instead.
-        skip_if_unsplit = exclude_hole_blobs and has_hole
+        # unsplit object below -- gating the drop here instead of upfront
+        # matters because several live cells clustered around an incidental
+        # gap can also produce a mask with a hole, and splitting would still
+        # correctly recover them as separate real cells. Excluding upfront
+        # would silently drop that whole cluster instead. has_hole itself is
+        # always carried through (even when not dropping) so callers can tag
+        # a detection as a likely dead cell without discarding it.
+        drop_if_unsplit = exclude_hole_blobs and has_hole
 
         # small blobs → single cell, skip splitting
         if area < min_split_area:
-            if not skip_if_unsplit:
-                out.append((rc, None))
+            if not drop_if_unsplit:
+                out.append((rc, None, has_hole))
             continue
 
         # isolate blob
@@ -277,8 +279,8 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
 
         dist = cv2.distanceTransform(blob_mask, cv2.DIST_L2, 5)
         if dist.max() <= 0:
-            if not skip_if_unsplit:
-                out.append((rc, None))
+            if not drop_if_unsplit:
+                out.append((rc, None, has_hole))
             continue
 
         if use_intensity_peaks and gray is not None:
@@ -301,8 +303,8 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
 
         if len(coords) <= 1:
             # only one cell center found → single cell
-            if not skip_if_unsplit:
-                out.append((rc, None))
+            if not drop_if_unsplit:
+                out.append((rc, None, has_hole))
             continue
 
         peak_mask = np.zeros(dist.shape, dtype=bool)
@@ -322,11 +324,13 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
             cs, _ = cv2.findContours(obj, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for c in cs:
                 if cv2.contourArea(c) >= min_area:
-                    out.append((c, label_to_seed.get(label)))
+                    # a piece from an actual multi-seed split is a recovered real
+                    # cell, not the dead-cell signature -- never tag it as one
+                    out.append((c, label_to_seed.get(label), False))
                     split_any = True
 
-        if not split_any and not skip_if_unsplit:
-            out.append((rc, None))
+        if not split_any and not drop_if_unsplit:
+            out.append((rc, None, has_hole))
 
     return out
 
@@ -356,13 +360,13 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prom
                                             est_cell_area=args.watershed_est_cell_area,
                                             exclude_hole_blobs=args.exclude_hole_blobs)
     else:
-        cs_holes = find_outer_contours(th, want_hole_flag=args.exclude_hole_blobs)
-        contour_seed_pairs = [(c, None) for c, has_hole in cs_holes
+        cs_holes = find_outer_contours(th, want_hole_flag=True)
+        contour_seed_pairs = [(c, None, has_hole) for c, has_hole in cs_holes
                                if not (args.exclude_hole_blobs and has_hole)]
 
     detections = []
     det_boxes  = []
-    for c, seed in contour_seed_pairs:
+    for c, seed, is_hole in contour_seed_pairs:
         area = cv2.contourArea(c)
         if area < args.min_area or area > args.max_area:
             continue
@@ -398,9 +402,9 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prom
                       and area >= args.streak_min_area
                       and long_axis >= args.streak_min_len
                       and long_axis/short_axis >= args.streak_ar)
-        detections.append((cx, cy, is_streak))
-        det_boxes.append((x, y, w, h, is_streak))
-    return [c for c, _ in contour_seed_pairs], detections, det_boxes
+        detections.append((cx, cy, is_streak, is_hole))
+        det_boxes.append((x, y, w, h, is_streak, is_hole))
+    return [c for c, _, _ in contour_seed_pairs], detections, det_boxes
 
 
 def print_blob_size_diagnostics(th, args):
@@ -507,8 +511,9 @@ def save_preview(th, frame, gray, args, raw_diff=None):
                                              raw_diff=raw_diff, **make_kwargs(row_val))
             print(f"{fg:>10.2f} {row_val:>16.2f} {len(detections):>6}")
             tile = frame.copy()
-            for i, (cx, cy, _is_streak) in enumerate(detections):
-                cv2.circle(tile, (cx, cy), 3, (0, 255, 0), -1)
+            for i, (cx, cy, _is_streak, is_hole) in enumerate(detections):
+                col = (0, 0, 255) if is_hole else (0, 255, 0)
+                cv2.circle(tile, (cx, cy), 3, col, -1)
                 cv2.putText(tile, str(i + 1), (cx + 4, cy - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
             cv2.putText(tile, f"fg={fg:g} {row_label[:4]}={row_val:g} n={len(detections)}",
@@ -912,6 +917,7 @@ def main():
     counts             = defaultdict(int)
     streak_only_counts = defaultdict(int)
     short_track_counts = defaultdict(int)
+    dead_cell_counts   = defaultdict(int)
     per_rows = []
 
     vw = None
@@ -992,6 +998,14 @@ def main():
             bucket = streak_only_counts if st["is_streak"] else short_track_counts
             bucket[tb] += 1
             counted_as = "streak_only_short" if st["is_streak"] else "short_track"
+        # Majority vote across the track's own lifetime, not just its last frame --
+        # a cell that showed the dead-cell hole signature (see --exclude_hole_blobs)
+        # in most of the frames it was seen in is classified as a dead cell here,
+        # tagged alongside (not instead of) its speed-bin/streak/short bucket above,
+        # since live/dead is a separate dimension from how it was counted.
+        is_dead_cell = st["dead_count"] * 2 >= st["seen_count"]
+        if is_dead_cell:
+            dead_cell_counts[tb] += 1
         # Always record a per_rows entry regardless of which bucket it landed in --
         # short_track/streak cells are the ones most likely to be noise (only tracked
         # a frame or two), so they're exactly the ones worth being able to verify,
@@ -1000,6 +1014,7 @@ def main():
             per_rows.append(dict(
                 track_id=tid, final_reason=reason, counted_as=counted_as,
                 seen_count=st["seen_count"], is_streak=int(st["is_streak"]),
+                is_dead_cell=int(is_dead_cell),
                 speed=v, speed_unit="m/s" if args.m_per_px else "px/s",
                 time_exit_s_abs=t_abs, time_exit_s_rel=t_rel,
                 x_exit=x_e, y_exit=y_e))
@@ -1107,7 +1122,7 @@ def main():
         pairs, unmatched = hungarian_match(tracks, detections, args.max_dist)
 
         for tid, j in pairs:
-            cx, cy, is_streak = detections[j]
+            cx, cy, is_streak, is_hole = detections[j]
             st = tracks[tid]
             st["cx"], st["cy"] = cx, cy
             st["last_seen_frame"] = cur_frame
@@ -1115,10 +1130,11 @@ def main():
             st["missed_count"] = 0
             st["updated"]      = True
             st["is_streak"]    = st["is_streak"] or is_streak
+            st["dead_count"]  += 1 if is_hole else 0
             st["end_x"], st["end_y"] = cx, cy
 
         for j in unmatched:
-            cx, cy, is_streak = detections[j]
+            cx, cy, is_streak, is_hole = detections[j]
             if args.enable_streak and is_streak:
                 while (recent_streaks
                        and cur_frame - recent_streaks[0][0] > args.streak_merge_window):
@@ -1130,6 +1146,7 @@ def main():
             tracks[next_id] = dict(
                 cx=cx, cy=cy, first_frame=cur_frame, last_seen_frame=cur_frame,
                 seen_count=1, missed_count=0, is_streak=bool(is_streak),
+                dead_count=1 if is_hole else 0,
                 updated=True, start_x=cx, start_y=cy, end_x=cx, end_y=cy)
             next_id += 1
 
@@ -1175,12 +1192,13 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX,0.45,(255,255,255),1)
 
             if args.draw_detections:
-                for (x,y,w,h,is_s) in det_boxes:
-                    col = (0,255,255) if is_s else (255,0,255)
+                for (x,y,w,h,is_s,is_hole) in det_boxes:
+                    col = (0,0,255) if is_hole else ((0,255,255) if is_s else (255,0,255))
                     cv2.rectangle(left,(x,y),(x+w,y+h),col,1)
 
             for tid,st in tracks.items():
-                col = (0,255,0) if not st["is_streak"] else (0,255,255)
+                dead = st["dead_count"] * 2 >= st["seen_count"]
+                col = (0,0,255) if dead else ((0,255,0) if not st["is_streak"] else (0,255,255))
                 cv2.circle(left,(st["cx"],st["cy"]),3,col,-1)
                 cv2.putText(left,str(tid),(st["cx"]+4,st["cy"]-4),
                             cv2.FONT_HERSHEY_SIMPLEX,0.4,(255,255,255),1)
@@ -1228,7 +1246,7 @@ def main():
               + [f"{edges[-1]}_inf"])
     cols = (["time_start_s","time_end_s"]
             + [f"speedbin_{l}" for l in labels]
-            + ["streak_only_short","short_track","total_counted"])
+            + ["streak_only_short","short_track","total_counted","dead_cell_count"])
 
     rows = []
     for tb in range(max_tb+1):
@@ -1238,7 +1256,10 @@ def main():
             c=counts.get((tb,sb),0); row.append(c); tot+=c
         c=counts.get((tb,len(edges)-1),0); row.append(c); tot+=c
         cs=streak_only_counts.get(tb,0); ch=short_track_counts.get(tb,0)
-        row+=[cs,ch,tot+cs+ch]; rows.append(row)
+        # dead_cell_count is a tag on cells already included in the counts above
+        # (a subset, not an additional population) -- do not add it into totals.
+        dc=dead_cell_counts.get(tb,0)
+        row+=[cs,ch,tot+cs+ch,dc]; rows.append(row)
 
     df = pd.DataFrame(rows, columns=cols)
     sc = [c for c in df.columns if c.startswith("speedbin_")]
