@@ -351,12 +351,14 @@ def local_blob_sharpness(gray, cx, cy, radius):
     to read as artificially uniform/low-variance there too, which would wrongly
     flag real edge-of-frame cells as dead.
 
-    NOTE: the raw variance is not comparable across frames -- confirmed on real
-    footage that a whole frame's baseline sharpness can differ enough (e.g. a
-    lower-density, earlier timepoint measured roughly half the median variance
-    of a later, denser one) that a single fixed cutoff either over- or
-    under-flags depending on the frame. See --dead_cell_percentile, which
-    thresholds against each frame's own distribution instead.
+    NOTE: the raw variance's absolute scale does drift some between frames
+    (confirmed: an earlier, lower-density timepoint measured a lower median
+    than a later, denser one), which is why --dead_cell_max_sharpness needed
+    retuning (550 -> 450) once checked against a second timepoint. A per-frame
+    relative/percentile threshold was tried as a fix but rejected: the user
+    confirmed a frame can legitimately be mostly dead, which a percentile rank
+    can never express since it always tags close to the requested percentile
+    regardless of the true proportion. See --dead_cell_max_sharpness.
     """
     y0, y1 = cy - radius, cy + radius
     x0, x1 = cx - radius, cx + radius
@@ -743,30 +745,31 @@ def main():
                          "Gaussian-smoothed gray used for MOG2 -- that smoothing was confirmed to "
                          "wash out this signal almost entirely, reading nearly everything as "
                          "'blurry'), in a small patch around its center is below this FIXED value. "
-                         "CAUTION: confirmed on real footage that a whole frame's baseline "
-                         "sharpness can drift enough between timepoints (an earlier, lower-density "
-                         "frame measured roughly half the median variance of a later, denser one) "
-                         "that a fixed cutoff calibrated on one frame over-flags real live cells on "
-                         "another -- e.g. 550 (which correctly tagged 6/7 labeled dead cells at "
-                         "t=280s) flagged ~85%% of detections, including two the user confirmed "
-                         "were alive, at t=90s. --dead_cell_percentile (below) fixes this by "
-                         "ranking within each frame instead and should be preferred; use this only "
-                         "if you have a specific reason to want the same absolute cutoff everywhere. "
-                         "Tags only (see is_dead_cell in --per_object_csv and dead_cell_count in "
-                         "--out_csv); does not exclude anything from the count. Default None = "
-                         "disabled. Ignored if --dead_cell_percentile is also set.")
+                         "This is the recommended mode -- --dead_cell_percentile (below) was tried "
+                         "first but rejected: it ranks within each frame and so mechanically forces "
+                         "a fixed tag rate everywhere, which cannot represent a real frame where "
+                         "most cells actually are dead (confirmed: the user identified t=90s as "
+                         "mostly-dead-except-two, which a percentile-based rank can never output). "
+                         "Try 450 as a starting point for this footage -- confirmed against 7 "
+                         "user-labeled dead cells (t=280s, 5/7 tagged) and 2 user-confirmed-alive "
+                         "cells at t=90s that a higher value (550) wrongly caught (both correctly "
+                         "excluded at 450, while still tagging ~75%% of that frame as dead, matching "
+                         "the user's own read of it). Tags only (see is_dead_cell in "
+                         "--per_object_csv and dead_cell_count in --out_csv); does not exclude "
+                         "anything from the count. Default None = disabled. Ignored if "
+                         "--dead_cell_percentile is also set.")
     ap.add_argument("--dead_cell_percentile", type=float, default=None,
                     help="Tag a detection as a dead cell if its Laplacian variance (see "
                          "--dead_cell_max_sharpness for what this measures and why) falls below "
                          "this percentile (0-100) of all detections in the SAME frame, instead of "
-                         "a fixed absolute value. This is the recommended way to use the dead-cell "
-                         "signal: confirmed a fixed cutoff doesn't transfer across timepoints (see "
-                         "--dead_cell_max_sharpness), because per-frame baseline sharpness drifts "
-                         "with density/lighting -- ranking within the frame's own distribution "
-                         "avoids that. Not yet validated end-to-end across a full run -- verify "
-                         "with --preview_frame_s at several timepoints (not just one) before "
-                         "trusting it. Tags only, does not exclude anything. Default None = "
-                         "disabled.")
+                         "a fixed absolute value. NOT recommended -- tried this to fix "
+                         "--dead_cell_max_sharpness's cross-frame drift problem, but the user then "
+                         "confirmed a frame can legitimately be mostly-dead (t=90s, ~75%% dead by "
+                         "their own read), which ranking within the frame can never express since "
+                         "it always tags close to the requested percentile regardless of the true "
+                         "proportion. Kept available in case a use case genuinely wants relative "
+                         "ranking, but --dead_cell_max_sharpness is the validated default choice. "
+                         "Tags only, does not exclude anything. Default None = disabled.")
     ap.add_argument("--dead_cell_sharpness_radius", type=int, default=8,
                     help="Patch half-size (px) for the dead-cell Laplacian variance measurement "
                          "(--dead_cell_max_sharpness / --dead_cell_percentile). Default 8, matched "
