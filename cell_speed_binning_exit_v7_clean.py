@@ -335,31 +335,35 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
     return out
 
 
-def local_blob_is_blurry(gray, cx, cy, radius, max_sharpness):
+def local_blob_sharpness(gray, cx, cy, radius):
     """
-    Dead-cell signature confirmed directly against user-labeled examples (t=280s,
-    detections 143/13/17/43/113/118/34): unlike the sharp, high-contrast
-    bright-halo ring of a live cell, these show up as a soft, blurred, halo-less
-    dark blob -- consistent with them sitting outside the imaging focal plane
-    (e.g. settled to the channel floor) rather than flowing through it in focus.
-    Measured as Laplacian variance (a standard focus/blur metric) in a small
-    patch around the detection center: low variance = few sharp edges = blurry.
-    Replaces an earlier mask-hole-based guess that the user directly confirmed
-    was wrong (none of the 7 labeled examples had a mask hole) -- this one was
-    verified instead: tight-radius Laplacian variance put 6 of the 7 in the
-    bottom ~20% of the whole frame's detections, and the 7th (contaminated by a
-    touching bright neighbor at the tested radius) still visually matches.
-    Requires the patch to be reasonably centered in-frame: a patch clipped by
-    the image border reads as artificially uniform/low-variance too (confirmed
-    to produce exactly this false signal for two detections sitting right at
-    the frame edge), which would wrongly flag real edge-of-frame cells.
+    Laplacian variance (a standard focus/blur metric) in a small patch around
+    (cx, cy) on an unblurred grayscale image -- low variance = few sharp edges
+    = blurry. This is the dead-cell signature confirmed directly against
+    user-labeled examples (t=280s, detections 143/13/17/43/113/118/34): unlike
+    the sharp, high-contrast bright-halo ring of a live cell, these show up as
+    a soft, blurred, halo-less dark blob -- consistent with sitting outside the
+    imaging focal plane (e.g. settled to the channel floor) rather than flowing
+    through it. Replaces an earlier mask-hole-based guess the user directly
+    confirmed was wrong (none of the 7 labeled examples had a mask hole).
+
+    Returns None if the patch would be clipped by the frame border -- confirmed
+    to read as artificially uniform/low-variance there too, which would wrongly
+    flag real edge-of-frame cells as dead.
+
+    NOTE: the raw variance is not comparable across frames -- confirmed on real
+    footage that a whole frame's baseline sharpness can differ enough (e.g. a
+    lower-density, earlier timepoint measured roughly half the median variance
+    of a later, denser one) that a single fixed cutoff either over- or
+    under-flags depending on the frame. See --dead_cell_percentile, which
+    thresholds against each frame's own distribution instead.
     """
     y0, y1 = cy - radius, cy + radius
     x0, x1 = cx - radius, cx + radius
     if y0 < 0 or x0 < 0 or y1 > gray.shape[0] or x1 > gray.shape[1]:
-        return False
+        return None
     patch = gray[y0:y1, x0:x1].astype(np.float64)
-    return cv2.Laplacian(patch, cv2.CV_64F).var() < max_sharpness
+    return cv2.Laplacian(patch, cv2.CV_64F).var()
 
 
 def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prominence_frac=None,
@@ -397,12 +401,13 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prom
     # every detection as "blurry", not just the true dead cells). Recompute an
     # unblurred grayscale from the raw frame instead, once per call, only when
     # actually needed.
-    sharp_gray = None
-    if args.dead_cell_max_sharpness is not None:
-        sharp_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    want_sharpness = args.dead_cell_max_sharpness is not None or args.dead_cell_percentile is not None
+    sharp_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if want_sharpness else None
 
-    detections = []
-    det_boxes  = []
+    # Staged first pass: gather everything except the dead-cell tag, since
+    # --dead_cell_percentile needs every candidate's sharpness collected before
+    # it can rank them against each other (see below).
+    staged = []
     for c, seed, _has_hole in contour_seed_pairs:
         area = cv2.contourArea(c)
         if area < args.min_area or area > args.max_area:
@@ -439,10 +444,32 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prom
                       and area >= args.streak_min_area
                       and long_axis >= args.streak_min_len
                       and long_axis/short_axis >= args.streak_ar)
+        sharpness = local_blob_sharpness(sharp_gray, cx, cy, args.dead_cell_sharpness_radius) \
+                    if sharp_gray is not None else None
+        staged.append((cx, cy, is_streak, x, y, w, h, sharpness))
+
+    # --dead_cell_percentile ranks each detection against this frame's own
+    # sharpness distribution instead of a fixed absolute cutoff -- confirmed
+    # necessary on real footage: a whole frame's baseline sharpness can differ
+    # enough between timepoints (an earlier, lower-density frame measured
+    # roughly half the median variance of a later, denser one) that a single
+    # fixed --dead_cell_max_sharpness value either over-flagged real live cells
+    # (sparse/dim frame) or under-flagged real dead ones (dense/sharp frame).
+    percentile_cutoff = None
+    if args.dead_cell_percentile is not None:
+        valid = [s[7] for s in staged if s[7] is not None]
+        if valid:
+            percentile_cutoff = np.percentile(valid, args.dead_cell_percentile)
+
+    detections = []
+    det_boxes  = []
+    for cx, cy, is_streak, x, y, w, h, sharpness in staged:
         is_dead = False
-        if sharp_gray is not None:
-            is_dead = local_blob_is_blurry(sharp_gray, cx, cy, args.dead_cell_sharpness_radius,
-                                            args.dead_cell_max_sharpness)
+        if sharpness is not None:
+            if percentile_cutoff is not None:
+                is_dead = sharpness < percentile_cutoff
+            elif args.dead_cell_max_sharpness is not None:
+                is_dead = sharpness < args.dead_cell_max_sharpness
         detections.append((cx, cy, is_streak, is_dead))
         det_boxes.append((x, y, w, h, is_streak, is_dead))
     return [c for c, _, _ in contour_seed_pairs], detections, det_boxes
@@ -715,29 +742,38 @@ def main():
                          "focus/blur metric), measured on the raw unblurred frame (not the "
                          "Gaussian-smoothed gray used for MOG2 -- that smoothing was confirmed to "
                          "wash out this signal almost entirely, reading nearly everything as "
-                         "'blurry'), in a small patch around its center is below this value. "
-                         "Confirmed directly against 7 user-labeled dead cells (t=280s): unlike a "
-                         "live cell's sharp, high-contrast bright-halo ring, these show as a soft, "
-                         "blurred, halo-less dark blob -- consistent with sitting outside the "
-                         "imaging focal plane rather than flowing through it. At "
-                         "--dead_cell_sharpness_radius 8 and threshold 550, 6 of 7 are tagged "
-                         "(the 7th sits touching a bright neighbor within that radius, which "
-                         "inflates its score, but still visually matches); checking other "
-                         "low-scoring detections beyond those 7 at this threshold (19 of 184 total) "
-                         "found the same visual phenotype, not false positives -- try 550 as a "
-                         "starting point for this footage. Tags only (see is_dead_cell in "
-                         "--per_object_csv and dead_cell_count in --out_csv); does not exclude "
-                         "anything from the count. Default None = disabled (no tagging happens, "
-                         "is_dead_cell always False). Verify with --preview_frame_s before trusting "
-                         "it on new footage: a patch clipped by the image border reads as falsely "
-                         "blurry, though this is already guarded against (edge-touching detections "
-                         "are never tagged).")
+                         "'blurry'), in a small patch around its center is below this FIXED value. "
+                         "CAUTION: confirmed on real footage that a whole frame's baseline "
+                         "sharpness can drift enough between timepoints (an earlier, lower-density "
+                         "frame measured roughly half the median variance of a later, denser one) "
+                         "that a fixed cutoff calibrated on one frame over-flags real live cells on "
+                         "another -- e.g. 550 (which correctly tagged 6/7 labeled dead cells at "
+                         "t=280s) flagged ~85%% of detections, including two the user confirmed "
+                         "were alive, at t=90s. --dead_cell_percentile (below) fixes this by "
+                         "ranking within each frame instead and should be preferred; use this only "
+                         "if you have a specific reason to want the same absolute cutoff everywhere. "
+                         "Tags only (see is_dead_cell in --per_object_csv and dead_cell_count in "
+                         "--out_csv); does not exclude anything from the count. Default None = "
+                         "disabled. Ignored if --dead_cell_percentile is also set.")
+    ap.add_argument("--dead_cell_percentile", type=float, default=None,
+                    help="Tag a detection as a dead cell if its Laplacian variance (see "
+                         "--dead_cell_max_sharpness for what this measures and why) falls below "
+                         "this percentile (0-100) of all detections in the SAME frame, instead of "
+                         "a fixed absolute value. This is the recommended way to use the dead-cell "
+                         "signal: confirmed a fixed cutoff doesn't transfer across timepoints (see "
+                         "--dead_cell_max_sharpness), because per-frame baseline sharpness drifts "
+                         "with density/lighting -- ranking within the frame's own distribution "
+                         "avoids that. Not yet validated end-to-end across a full run -- verify "
+                         "with --preview_frame_s at several timepoints (not just one) before "
+                         "trusting it. Tags only, does not exclude anything. Default None = "
+                         "disabled.")
     ap.add_argument("--dead_cell_sharpness_radius", type=int, default=8,
-                    help="Patch half-size (px) for --dead_cell_max_sharpness's Laplacian variance "
-                         "measurement. Default 8, matched to this footage's cell size -- a patch "
-                         "much smaller than one cell mixes in background noise, much larger mixes "
-                         "in neighboring cells (confirmed to inflate the score and mask the "
-                         "signal on a cell sitting next to a bright neighbor).")
+                    help="Patch half-size (px) for the dead-cell Laplacian variance measurement "
+                         "(--dead_cell_max_sharpness / --dead_cell_percentile). Default 8, matched "
+                         "to this footage's cell size -- a patch much smaller than one cell mixes "
+                         "in background noise, much larger mixes in neighboring cells (confirmed "
+                         "to inflate the score and mask the signal on a cell sitting next to a "
+                         "bright neighbor).")
     ap.add_argument("--min_local_motion", type=float, default=0.0,
                     help="Minimum mean frame-to-frame pixel difference (0-255) in a small "
                          "window around a detected cell's position for it to count. Rejects "
