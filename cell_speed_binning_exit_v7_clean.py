@@ -711,6 +711,18 @@ def main():
     ap.add_argument("--speed_bins", required=True)
     ap.add_argument("--m_per_px", type=float, default=None)
     ap.add_argument("--fps",      type=float, default=None)
+    ap.add_argument("--frame_stride", type=int, default=1,
+                    help="Only fully process 1 out of every N frames (default 1 = every "
+                         "frame); the other N-1 are cheaply skipped via cap.grab() (no "
+                         "decode, no MOG2, no tracking), cutting runtime roughly N-fold on "
+                         "high-fps footage that oversamples relative to how fast cells "
+                         "actually move. Frame indices (and therefore all time/speed math) "
+                         "stay in true video time -- only the gap between frames the "
+                         "tracker actually sees grows, so --max_dist likely needs "
+                         "increasing by roughly the same factor N or fast cells will "
+                         "fragment into multiple short tracks instead of one. Verify cell "
+                         "counts are stable before/after enabling this (--preview_frame_s) "
+                         "rather than assuming it's free.")
 
     ap.add_argument("--min_area",   type=float, default=12)
     ap.add_argument("--max_area",   type=float, default=8000)
@@ -1129,6 +1141,21 @@ def main():
     while True:
         if end_frame_excl is not None and abs_frame >= end_frame_excl:
             break
+        # --frame_stride cheaply skips decode+MOG2+tracking entirely on frames that
+        # aren't a multiple of the stride away from warmup_start, via cap.grab()
+        # (discards the frame without decoding it -- far cheaper than cap.read(),
+        # which is the actual dominant cost being cut here). abs_frame still counts
+        # every real frame at the video's true fps, so all time/speed math (which
+        # is frame-index-based, not loop-iteration-based) stays correct unchanged;
+        # only the effective time gap between *processed* frames grows, which is
+        # why --max_dist likely needs increasing roughly proportionally to
+        # --frame_stride (a cell now moves stride-times further between the frames
+        # the tracker actually sees).
+        if args.frame_stride > 1 and (abs_frame - warmup_start) % args.frame_stride != 0:
+            if not cap.grab():
+                break
+            abs_frame += 1
+            continue
         ret, frame = cap.read()
         if not ret or frame is None:
             break
