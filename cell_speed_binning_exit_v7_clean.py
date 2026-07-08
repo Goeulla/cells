@@ -368,6 +368,64 @@ def local_blob_sharpness(gray, cx, cy, radius):
     return cv2.Laplacian(patch, cv2.CV_64F).var()
 
 
+def calibrate_dead_cell_reference(video_path, warmup_start, start_frame, fps, args, percentile=75):
+    """
+    --dead_cell_max_sharpness is a fixed pixel-variance number, which only means
+    anything relative to one specific video's own brightness/contrast -- confirmed
+    directly: a value (450) validated on one video wrongly tagged ~84% of cells as
+    dead on a second, visually darker/lower-contrast video, because that video's
+    whole sharpness scale sits lower across the board, not because most of its
+    cells are actually dead. Rather than requiring a fresh labeled example and a
+    manual retune for every new video, this measures THIS video's own typical
+    sharpness once (a throwaway MOG2 pass over the start of the analysis window,
+    not reused for the real run -- needs its own instance since MOG2 is stateful)
+    and returns a percentile of it, so --dead_cell_relative_thresh (a fraction of
+    this reference) can set an absolute cutoff that auto-scales per video instead
+    of a hardcoded number tuned on different footage.
+
+    Deliberately samples starting at start_frame (not warmup_start): the
+    background model is still adapting during warmup, which would bias the
+    measured sharpness distribution. Returns None if no detections were found in
+    the sample window at all (nothing to calibrate against).
+    """
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, warmup_start)
+    backsub = cv2.createBackgroundSubtractorMOG2(
+        history=args.mog2_history, varThreshold=args.mog2_varThreshold, detectShadows=False)
+    sample_end = start_frame + int(10 * fps)
+    sharpness_vals = []
+    f = warmup_start
+    while f < sample_end:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if args.gauss_ksize > 0:
+            k = args.gauss_ksize | 1
+            gray = cv2.GaussianBlur(gray, (k, k), 0)
+        fgm = backsub.apply(gray, learningRate=float(args.learning_rate))
+        _, th = cv2.threshold(fgm, args.mask_thresh, 255, cv2.THRESH_BINARY)
+        if f >= start_frame:
+            sharp_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            cs, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in cs:
+                area = cv2.contourArea(c)
+                if area < args.min_area or area > args.max_area:
+                    continue
+                M = cv2.moments(c)
+                if M["m00"] == 0:
+                    continue
+                cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+                sv = local_blob_sharpness(sharp_gray, cx, cy, args.dead_cell_sharpness_radius)
+                if sv is not None:
+                    sharpness_vals.append(sv)
+        f += 1
+    cap.release()
+    if not sharpness_vals:
+        return None
+    return float(np.percentile(sharpness_vals, percentile))
+
+
 def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prominence_frac=None,
                   raw_diff=None):
     """
@@ -789,6 +847,20 @@ def main():
                          "in background noise, much larger mixes in neighboring cells (confirmed "
                          "to inflate the score and mask the signal on a cell sitting next to a "
                          "bright neighbor).")
+    ap.add_argument("--dead_cell_relative_thresh", type=float, default=None,
+                    help="Auto-calibrating alternative to --dead_cell_max_sharpness: instead of a "
+                         "fixed pixel-variance number (which only means something relative to the "
+                         "specific video it was tuned on -- confirmed a value validated on one "
+                         "video wrongly tagged ~84%% of cells as dead on a second, visually darker "
+                         "video, since that video's whole sharpness scale sits lower across the "
+                         "board), this measures THIS video's own typical in-focus sharpness once "
+                         "(a throwaway pass over the first ~10s of the analysis window) and sets "
+                         "the actual cutoff to this fraction of that reference. Try 0.4-0.45 as a "
+                         "starting point (back-derived from the 450 cutoff that worked against a "
+                         "video whose own reference sharpness measured ~1030). Overrides "
+                         "--dead_cell_max_sharpness if both are set. Still tags only, does not "
+                         "exclude anything from the count -- and still worth spot-checking with "
+                         "--preview_frame_s on any new video rather than trusting blindly.")
     ap.add_argument("--min_local_motion", type=float, default=0.0,
                     help="Minimum mean frame-to-frame pixel difference (0-255) in a small "
                          "window around a detected cell's position for it to count. Rejects "
@@ -1000,6 +1072,19 @@ def main():
     end_frame_excl = int(args.end_s * fps) if args.end_s else None
     warmup_frames  = int(max(0.0, args.warmup_s) * fps)
     warmup_start   = max(0, start_frame - warmup_frames)
+
+    if args.dead_cell_relative_thresh is not None:
+        ref = calibrate_dead_cell_reference(args.video, warmup_start, start_frame, fps, args)
+        if ref is None:
+            print("WARNING: --dead_cell_relative_thresh set but no detections found in the "
+                  "calibration window (first ~10s of the analysis window) -- dead-cell tagging "
+                  "disabled for this run.")
+        else:
+            args.dead_cell_max_sharpness = args.dead_cell_relative_thresh * ref
+            print(f"Auto-calibrated dead-cell threshold for this video: reference sharpness "
+                  f"(p75 of real detections in the first ~10s) = {ref:.1f}, "
+                  f"--dead_cell_relative_thresh {args.dead_cell_relative_thresh:g} -> "
+                  f"effective cutoff = {args.dead_cell_max_sharpness:.1f}")
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, warmup_start)
     ret, frame0 = cap.read()
