@@ -1097,6 +1097,16 @@ def main():
                          "throwaway calibration pass and picks the most sensitive one (best at "
                          "catching faint cells) that doesn't push too many detections into "
                          "oversized/likely-merged boxes. See calibrate_mog2_varThreshold().")
+    ap.add_argument("--recalibrate_varThreshold_every_s", type=float, default=120.0,
+                    help="With --auto_mog2_varThreshold, re-run the calibration sweep every N "
+                         "seconds of video during the real run and update the live MOG2 "
+                         "instance's threshold in place (cv2's setVarThreshold(), which does not "
+                         "reset its accumulated background model). A single calibration at the "
+                         "start of the run is not enough: confirmed the right value drifts within "
+                         "a single video as density/contrast changes over time, not just between "
+                         "videos, so a threshold picked from the first 10s and used for the whole "
+                         "run is wrong everywhere else the video looks different. Set to 0 to "
+                         "calibrate once at the start only. Default 120s.")
     ap.add_argument("--learning_rate",     type=float, default=0.0005)
     ap.add_argument("--mask_thresh",       type=int,   default=60)
     ap.add_argument("--gauss_ksize",       type=int,   default=3)
@@ -1358,6 +1368,11 @@ def main():
             print(f"  varThreshold={varT:g}: n_detections={n}, oversized_frac={oversized_frac:.2f}, "
                   f"sliver_frac={sliver_frac:.2f}, growth_vs_prev={growth:.2f}{flag}")
 
+    recal_every_frames = (int(args.recalibrate_varThreshold_every_s * fps)
+                           if args.auto_mog2_varThreshold and args.recalibrate_varThreshold_every_s > 0
+                           else None)
+    next_recal_frame = start_frame + recal_every_frames if recal_every_frames else None
+
     cap.set(cv2.CAP_PROP_POS_FRAMES, warmup_start)
     ret, frame0 = cap.read()
     if not ret:
@@ -1535,6 +1550,22 @@ def main():
         cur_frame = abs_frame
         abs_frame += 1
         last_processed = cur_frame
+
+        if next_recal_frame is not None and cur_frame >= next_recal_frame:
+            # Own throwaway VideoCapture/MOG2 instance (same reasoning as the initial
+            # calibration -- MOG2 is stateful, can't share the live one), warmed up
+            # from a bit before cur_frame rather than a full fresh warmup_s: this is a
+            # mid-run recalibration checking how much the video's own characteristics
+            # have drifted since the last one, not a cold start.
+            recal_warmup_start = max(0, cur_frame - int(15 * fps))
+            new_varT, recal_stats = calibrate_mog2_varThreshold(
+                args.video, recal_warmup_start, cur_frame, fps, args)
+            if new_varT != args.mog2_varThreshold:
+                print(f"t={cur_frame/fps:.0f}s: re-calibrated --mog2_varThreshold "
+                      f"{args.mog2_varThreshold:g} -> {new_varT:g}")
+                args.mog2_varThreshold = new_varT
+                backsub.setVarThreshold(new_varT)
+            next_recal_frame = cur_frame + recal_every_frames
 
         if args.preview_frame_s is not None and cur_frame % 200 == 0:
             print(f"  ...scanned frame {cur_frame} (t={cur_frame/fps:.1f}s), "
