@@ -584,8 +584,16 @@ def calibrate_mog2_varThreshold(video_path, warmup_start, start_frame, fps, args
                  # splitting) is the expensive step, and 6 candidates x this many evals already
                  # multiplies calibration cost several-fold over a single-frame check
     eval_stride = max(1, int(sample_s * fps) // n_evals)
+    # A candidate found with zero (or almost zero) real detections trivially passes every
+    # check below -- an empty sample has no merging, no noise jump, no slivers to measure.
+    # Confirmed this is a real failure mode, not hypothetical: a calibration window landing
+    # in this video's known low-activity start found 0 detections at varThreshold 16/8/4/2
+    # and picked 2 as "clean" with zero actual evidence it's any better than 16, only
+    # stopping once varThreshold=1 finally produced 5 detections that were 100% slivers.
+    # Candidates below this floor are treated as unproven, not passing.
+    min_detections_to_trust = 15
     stats = {}
-    best = candidates[-1]  # fall back to the most conservative (highest) if none pass
+    best = candidates[0]  # fall back to the most conservative (highest) if none pass/qualify
     prev_n = None
     for varT in candidates:
         cap = cv2.VideoCapture(video_path)
@@ -627,10 +635,21 @@ def calibrate_mog2_varThreshold(video_path, warmup_start, start_frame, fps, args
         growth = ((total_n + growth_smooth_k) / (prev_n + growth_smooth_k)
                   if prev_n is not None else 1.0)
         stats[varT] = (total_n, oversized_frac, sliver_frac, growth)
-        if (oversized_frac <= max_oversized_frac and sliver_frac <= max_sliver_frac
+        if (total_n >= min_detections_to_trust
+                and oversized_frac <= max_oversized_frac and sliver_frac <= max_sliver_frac
                 and growth < max_growth_ratio):
             best = varT  # candidates iterate high->low, so last passing one is lowest/most sensitive
         prev_n = total_n
+
+    if stats.get(best, (0,))[0] < min_detections_to_trust:
+        print(f"WARNING: --auto_mog2_varThreshold calibration found fewer than "
+              f"{min_detections_to_trust} detections at every candidate threshold in this "
+              f"{sample_s:.0f}s sample window -- this looks like a low-activity period, not a "
+              f"clean-vs-noisy tradeoff. Falling back to the conservative default "
+              f"({candidates[0]:g}) rather than trusting a threshold with no real evidence "
+              f"behind it. If this run's counts look too low, consider a later --start_s or "
+              f"passing --mog2_varThreshold manually.")
+        best = candidates[0]
 
     return best, stats
 
