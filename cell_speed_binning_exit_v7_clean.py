@@ -508,7 +508,7 @@ def calibrate_mog2_varThreshold(video_path, warmup_start, start_frame, fps, args
                                  oversized_area_mult=40, max_oversized_frac=0.06,
                                  max_growth_ratio=2.0, growth_smooth_k=3,
                                  max_aspect_ratio=4.0, max_sliver_frac=0.10,
-                                 sample_s=10.0):
+                                 sample_s=10.0, n_evals=5):
     """
     --mog2_varThreshold is a fixed absolute cutoff, and confirmed directly on
     real footage that the right value is NOT a per-video constant, let alone a
@@ -579,10 +579,15 @@ def calibrate_mog2_varThreshold(video_path, warmup_start, start_frame, fps, args
     maps each tried value to (n_detections, oversized_frac, sliver_frac,
     growth_ratio), for the caller to print/log.
     """
+    # Tried capping this to a shorter throwaway warmup to cut the 6x redundant-warmup cost
+    # that makes this slow -- confirmed directly that's NOT safe: MOG2's background model
+    # genuinely hasn't finished settling at 15s vs. 45s, and it changed the actual answer
+    # (t=850s, varThreshold=2: 15s-warmup found 6 clean boxes, 45s-warmup found 7 including
+    # 2 real sliver artifacts the shorter warmup simply hadn't learned to suppress yet). A
+    # calibration that doesn't match the warmup the real run will actually have at that
+    # point isn't testing the right thing, so this always uses the caller's full
+    # warmup_start, at the cost of the 6x-redundant-warmup slowness that comes with it.
     sample_end = start_frame + int(sample_s * fps)
-    n_evals = 5  # a handful of spread-out frames, not every frame -- detect_cells (watershed
-                 # splitting) is the expensive step, and 6 candidates x this many evals already
-                 # multiplies calibration cost several-fold over a single-frame check
     eval_stride = max(1, int(sample_s * fps) // n_evals)
     # A candidate found with zero (or almost zero) real detections trivially passes every
     # check below -- an empty sample has no merging, no noise jump, no slivers to measure.
