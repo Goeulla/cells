@@ -368,7 +368,8 @@ def local_blob_sharpness(gray, cx, cy, radius):
     return cv2.Laplacian(patch, cv2.CV_64F).var()
 
 
-def calibrate_dead_cell_reference(video_path, warmup_start, start_frame, fps, args, percentile=75):
+def calibrate_dead_cell_reference(video_path, warmup_start, start_frame, fps, args, percentile=75,
+                                   min_samples=200, max_sample_s=120):
     """
     --dead_cell_max_sharpness is a fixed pixel-variance number, which only means
     anything relative to one specific video's own brightness/contrast -- confirmed
@@ -385,14 +386,28 @@ def calibrate_dead_cell_reference(video_path, warmup_start, start_frame, fps, ar
 
     Deliberately samples starting at start_frame (not warmup_start): the
     background model is still adapting during warmup, which would bias the
-    measured sharpness distribution. Returns None if no detections were found in
-    the sample window at all (nothing to calibrate against).
+    measured sharpness distribution.
+
+    A fixed 10s sample window is only reliable if that window happens to be
+    busy -- confirmed on real footage to fail exactly this way: a video whose
+    first ~90s were a near-empty priming/pre-flow period (0-4 detections per
+    frame, same pattern seen on other videos from this setup) gave a
+    calibration reference built from only a handful of samples, most of them
+    the same one or two cells re-measured across consecutive frames rather
+    than independent cells -- not a reliable estimate of the video's real
+    sharpness distribution. Extends the sampling window (up to
+    max_sample_s) until at least min_samples independent-ish measurements
+    are collected, since a low-activity start is common in this kind of
+    flow assay, not an edge case.
+
+    Returns (reference_value, n_samples, sampled_s) or (None, 0, sampled_s)
+    if nothing was found in the whole extended window.
     """
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, warmup_start)
     backsub = cv2.createBackgroundSubtractorMOG2(
         history=args.mog2_history, varThreshold=args.mog2_varThreshold, detectShadows=False)
-    sample_end = start_frame + int(10 * fps)
+    sample_end = start_frame + int(max_sample_s * fps)
     sharpness_vals = []
     f = warmup_start
     while f < sample_end:
@@ -419,11 +434,14 @@ def calibrate_dead_cell_reference(video_path, warmup_start, start_frame, fps, ar
                 sv = local_blob_sharpness(sharp_gray, cx, cy, args.dead_cell_sharpness_radius)
                 if sv is not None:
                     sharpness_vals.append(sv)
+            if len(sharpness_vals) >= min_samples and f >= start_frame + int(10 * fps):
+                break
         f += 1
     cap.release()
+    sampled_s = (min(f, sample_end) - start_frame) / fps
     if not sharpness_vals:
-        return None
-    return float(np.percentile(sharpness_vals, percentile))
+        return None, 0, sampled_s
+    return float(np.percentile(sharpness_vals, percentile)), len(sharpness_vals), sampled_s
 
 
 def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prominence_frac=None,
@@ -1074,15 +1092,21 @@ def main():
     warmup_start   = max(0, start_frame - warmup_frames)
 
     if args.dead_cell_relative_thresh is not None:
-        ref = calibrate_dead_cell_reference(args.video, warmup_start, start_frame, fps, args)
+        ref, n_samples, sampled_s = calibrate_dead_cell_reference(
+            args.video, warmup_start, start_frame, fps, args)
         if ref is None:
-            print("WARNING: --dead_cell_relative_thresh set but no detections found in the "
-                  "calibration window (first ~10s of the analysis window) -- dead-cell tagging "
-                  "disabled for this run.")
+            print(f"WARNING: --dead_cell_relative_thresh set but no detections found in "
+                  f"{sampled_s:.0f}s of calibration sampling -- dead-cell tagging disabled "
+                  f"for this run.")
         else:
             args.dead_cell_max_sharpness = args.dead_cell_relative_thresh * ref
+            if n_samples < 200:
+                print(f"WARNING: dead-cell calibration only found {n_samples} samples in "
+                      f"{sampled_s:.0f}s (wanted >=200) -- this video's start is low-activity, "
+                      f"so the reference below may be noisy. Consider passing a later --start_s "
+                      f"if this run's counts look off.")
             print(f"Auto-calibrated dead-cell threshold for this video: reference sharpness "
-                  f"(p75 of real detections in the first ~10s) = {ref:.1f}, "
+                  f"(p75 of {n_samples} real detections over {sampled_s:.0f}s) = {ref:.1f}, "
                   f"--dead_cell_relative_thresh {args.dead_cell_relative_thresh:g} -> "
                   f"effective cutoff = {args.dead_cell_max_sharpness:.1f}")
 
