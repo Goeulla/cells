@@ -1024,7 +1024,39 @@ def main():
     ap.add_argument("--streak_merge_dist",   type=float, default=25)
     ap.add_argument("--streak_merge_window", type=int,   default=2)
 
-    ap.add_argument("--dedup_window", type=float, default=0.15)
+    ap.add_argument("--dedup_window", type=float, default=0.15,
+                    help="Time window (s) for treating a re-exit near the same spot as the "
+                         "same cell, not a new one. Only applies to tracks whose speed is above "
+                         "--dedup_slow_speed_thresh -- see --dedup_window_slow for the slow case, "
+                         "which this default is deliberately too short for.")
+    ap.add_argument("--dedup_window_slow", type=float, default=150.0,
+                    help="Like --dedup_window, but used instead whenever either the new exit or "
+                         "the earlier one being compared against has speed <= "
+                         "--dedup_slow_speed_thresh. Confirmed necessary on real footage: a "
+                         "slow/adhesion-interacting cell can flicker in and out of detection "
+                         "(a known MOG2 weakness -- near-static objects can get intermittently "
+                         "absorbed into the background model) over tens of seconds, each "
+                         "reappearance otherwise counted as a brand new cell. Confirmed directly: "
+                         "the same physical cell counted 3 separate times, 68-90s apart, right at "
+                         "the exit boundary, each a 1-frame track with speed=0. Default 150s "
+                         "covers the widest gap seen so far; a fixed window can't rule out an "
+                         "even longer gap, or (the trade-off in the other direction) wrongly "
+                         "merging two genuinely different slow cells that happen to exit near the "
+                         "same spot more than --dedup_dist apart in time but within this window -- "
+                         "kept separate from --dedup_window specifically so fast cells (which "
+                         "cross the exit zone in under a second and are in no danger of a real "
+                         "second cell coincidentally landing on the same spot within 150s) aren't "
+                         "exposed to that trade-off.")
+    ap.add_argument("--dedup_slow_speed_thresh", type=float, default=5.0,
+                    help="Speed threshold (same units as --m_per_px implies, else px/s) below "
+                         "which a track uses --dedup_window_slow instead of --dedup_window for "
+                         "duplicate-exit checks. Default 5 px/s. Note a track too short to trust "
+                         "for speed (see --min_track_frames_for_speed) computes speed as 0 by "
+                         "construction (no measurable displacement over 1 frame) -- this is "
+                         "deliberate, not a bug: exactly these low-confidence short tracks are "
+                         "what the confirmed triple-counting case looked like, so treating them "
+                         "as 'possibly slow' for dedup purposes is the intended, conservative "
+                         "behavior, not an artifact to work around.")
     ap.add_argument("--dedup_dist",   type=float, default=25)
     ap.add_argument("--dedup_keep",   type=int,   default=4000)
 
@@ -1171,19 +1203,33 @@ def main():
         if args.exit_side == "bottom": return cy >= H - 1 - m
         return cy <= m
 
-    def is_duplicate_exit(t, x, y):
+    def is_duplicate_exit(t, x, y, v):
         # Drop stale entries by scanning the whole buffer rather than just the front:
         # a lingering cell refreshes its entry's timestamp below, so the buffer is not
         # guaranteed sorted by time and a front-only pop would leave old entries stuck.
-        kept = [(t0, x0, y0) for (t0, x0, y0) in recent_exits if t - t0 <= args.dedup_window]
-        for i, (t0, x0, y0) in enumerate(kept):
-            if math.hypot(x - x0, y - y0) <= args.dedup_dist:
+        # Pruning uses the longer of the two windows since either side of a pairwise
+        # comparison below might turn out to need it -- the per-pair effective window
+        # is decided inside the loop, not here.
+        max_window = max(args.dedup_window, args.dedup_window_slow)
+        kept = [(t0, x0, y0, v0) for (t0, x0, y0, v0) in recent_exits if t - t0 <= max_window]
+        for i, (t0, x0, y0, v0) in enumerate(kept):
+            # Either side being slow (or speed-unknown, which computes as 0 -- see
+            # --dedup_slow_speed_thresh) means this pair could plausibly be the same
+            # intermittently-detected cell, so use the generous window; only use the
+            # short one when both sides are confidently fast.
+            is_slow_pair = v <= args.dedup_slow_speed_thresh or v0 <= args.dedup_slow_speed_thresh
+            eff_window = args.dedup_window_slow if is_slow_pair else args.dedup_window
+            if t - t0 <= eff_window and math.hypot(x - x0, y - y0) <= args.dedup_dist:
                 # Refresh instead of leaving the original timestamp: a cell that just
                 # sits in the exit margin re-triggers crossed_exit() every frame (its
                 # track gets deleted and immediately recreated), and without refreshing,
                 # this entry would expire after exactly one dedup_window and let the
-                # same still-lingering cell be counted again as a new exit.
-                kept[i] = (t, x0, y0)
+                # same still-lingering cell be counted again as a new exit. Keep the
+                # slower of the two speeds seen so far: once a sighting of this spot
+                # was slow, later fast-looking re-detections (e.g. a 1-frame blip with
+                # speed 0) shouldn't accidentally graduate the entry back to the short
+                # window.
+                kept[i] = (t, x0, y0, min(v0, v))
                 recent_exits.clear()
                 recent_exits.extend(kept)
                 return True
@@ -1199,7 +1245,8 @@ def main():
 
     def finalize_track(t_abs, t_rel, st, tid, reason):
         x_e, y_e = float(st["end_x"]), float(st["end_y"])
-        if is_duplicate_exit(t_abs, x_e, y_e):
+        v = float(compute_speed(st))
+        if is_duplicate_exit(t_abs, x_e, y_e, v):
             return False
         allow_instant = args.allow_single_frame_count and reason == "passed_line"
         if not allow_instant and st["seen_count"] < args.min_seen_count:
@@ -1210,12 +1257,11 @@ def main():
             # don't record it in recent_exits either so it can't block a genuine later
             # detection at the same spot from being counted via dedup.
             return False
-        recent_exits.append((t_abs, x_e, y_e))
+        recent_exits.append((t_abs, x_e, y_e, v))
         if len(recent_exits) > args.dedup_keep:
             recent_exits.popleft()
         tb  = int(t_rel // args.bin_seconds)
         thr = 1 if allow_instant else args.min_track_frames_for_speed
-        v = float(compute_speed(st))
         if st["seen_count"] >= thr:
             sb = bin_index(v, edges)
             if sb is not None:
