@@ -1290,7 +1290,8 @@ def main():
                 is_dead_cell=int(is_dead_cell),
                 speed=v, speed_unit="m/s" if args.m_per_px else "px/s",
                 time_exit_s_abs=t_abs, time_exit_s_rel=t_rel,
-                x_exit=x_e, y_exit=y_e))
+                x_exit=x_e, y_exit=y_e,
+                x_start=float(st["start_x"]), y_start=float(st["start_y"])))
         return True
 
     while True:
