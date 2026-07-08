@@ -1126,6 +1126,16 @@ def main():
                          "videos, so a threshold picked from the first 10s and used for the whole "
                          "run is wrong everywhere else the video looks different. Set to 0 to "
                          "calibrate once at the start only. Default 120s.")
+    ap.add_argument("--varThreshold_schedule", type=str, default=None,
+                    help="Cheaper alternative to --auto_mog2_varThreshold: a fixed, hand-picked "
+                         "schedule instead of re-running the calibration sweep (6 candidates x "
+                         "5 eval frames each, repeated every --recalibrate_varThreshold_every_s) "
+                         "-- that repeated cost is real and this skips it entirely, at the cost "
+                         "of not adapting to variation the schedule's breakpoints don't happen "
+                         "to land on. Format: 'time_s:value,time_s:value,...' e.g. "
+                         "'0:0.5,300:4' -- varThreshold=0.5 from t=0, switching to 4 at t=300s. "
+                         "Applied via setVarThreshold() (does not reset the background model). "
+                         "Overrides --auto_mog2_varThreshold if both are given.")
     ap.add_argument("--learning_rate",     type=float, default=0.0005)
     ap.add_argument("--mask_thresh",       type=int,   default=60)
     ap.add_argument("--gauss_ksize",       type=int,   default=3)
@@ -1376,7 +1386,20 @@ def main():
                   f"--dead_cell_relative_thresh {args.dead_cell_relative_thresh:g} -> "
                   f"effective cutoff = {args.dead_cell_max_sharpness:.1f}")
 
-    if args.auto_mog2_varThreshold:
+    varT_schedule = None  # list of (frame_idx, value), sorted, consumed in main loop
+    if args.varThreshold_schedule:
+        parsed = []
+        for part in args.varThreshold_schedule.split(","):
+            t_str, v_str = part.split(":")
+            parsed.append((int(float(t_str) * fps), float(v_str)))
+        varT_schedule = sorted(parsed)
+        # apply every entry at/before start_frame now (skip straight to the right value
+        # instead of replaying the schedule from t=0 if --start_s begins partway through it)
+        while varT_schedule and varT_schedule[0][0] <= start_frame:
+            args.mog2_varThreshold = varT_schedule.pop(0)[1]
+        print(f"Using fixed --varThreshold_schedule: starting at "
+              f"{args.mog2_varThreshold:g}, {len(varT_schedule)} more switch(es) ahead.")
+    elif args.auto_mog2_varThreshold:
         best_varT, stats = calibrate_mog2_varThreshold(
             args.video, warmup_start, start_frame, fps, args)
         args.mog2_varThreshold = best_varT
@@ -1388,7 +1411,8 @@ def main():
                   f"sliver_frac={sliver_frac:.2f}, growth_vs_prev={growth:.2f}{flag}")
 
     recal_every_frames = (int(args.recalibrate_varThreshold_every_s * fps)
-                           if args.auto_mog2_varThreshold and args.recalibrate_varThreshold_every_s > 0
+                           if (args.auto_mog2_varThreshold and not varT_schedule
+                               and args.recalibrate_varThreshold_every_s > 0)
                            else None)
     next_recal_frame = start_frame + recal_every_frames if recal_every_frames else None
 
@@ -1569,6 +1593,12 @@ def main():
         cur_frame = abs_frame
         abs_frame += 1
         last_processed = cur_frame
+
+        while varT_schedule and cur_frame >= varT_schedule[0][0]:
+            args.mog2_varThreshold = varT_schedule.pop(0)[1]
+            print(f"t={cur_frame/fps:.0f}s: --varThreshold_schedule switching "
+                  f"--mog2_varThreshold to {args.mog2_varThreshold:g}")
+            backsub.setVarThreshold(args.mog2_varThreshold)
 
         if next_recal_frame is not None and cur_frame >= next_recal_frame:
             # Own throwaway VideoCapture/MOG2 instance (same reasoning as the initial
