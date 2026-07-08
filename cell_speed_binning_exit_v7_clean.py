@@ -144,6 +144,24 @@ def find_seeds_prominence(height_map, blob_mask, fg_thresh, prominence_frac, can
     return np.array([[y, x] for y, x, h in kept])
 
 
+def merge_seed_coords(coords_a, coords_b, min_dist):
+    """
+    Union two seed-coordinate arrays (e.g. bright-peak seeds and dark-peak seeds
+    from the two intensity polarities), dropping any coords_b point that lands
+    within min_dist of an already-kept point -- if both polarity searches landed
+    on essentially the same spot, that's one cell, not two.
+    """
+    if len(coords_a) == 0:
+        return coords_b
+    if len(coords_b) == 0:
+        return coords_a
+    kept = list(coords_a)
+    for y, x in coords_b:
+        if all(math.hypot(x - kx, y - ky) >= min_dist for ky, kx in kept):
+            kept.append(np.array([y, x]))
+    return np.array(kept)
+
+
 def estimate_merged_seeds(blob_mask, height_map, expected_count):
     """
     Last-resort fallback for a blob whose area implies more cells than any real
@@ -285,16 +303,57 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
 
         if use_intensity_peaks and gray is not None:
             height_map = np.where(blob_mask > 0, gray.astype(np.float64), -1.0)
+            # A single grayscale polarity only finds cells that are brighter than
+            # their surroundings. Confirmed on real footage that not every cell in
+            # a frame shares the same apparent polarity -- a dark-appearing cell
+            # sitting right next to a bright one is a minimum, not a maximum, in
+            # `gray`, so it never produces its own peak and the pair collapses
+            # into one detection. Searching the inverted map too (dark = high)
+            # recovers that second seed; the two seed sets are then merged.
+            inv_height_map = np.where(blob_mask > 0, 255.0 - gray.astype(np.float64), -1.0)
         else:
             height_map = dist
+            inv_height_map = None
 
         if prominence_frac is not None:
             coords = find_seeds_prominence(height_map, blob_mask, fg_thresh, prominence_frac,
                                             candidate_min_dist=min_peak_dist)
+            if inv_height_map is not None:
+                dark_coords = find_seeds_prominence(inv_height_map, blob_mask, fg_thresh,
+                                                      prominence_frac, candidate_min_dist=min_peak_dist)
+                n_bright = len(coords)
+                coords = merge_seed_coords(coords, dark_coords, min_peak_dist)
         else:
             coords = peak_local_max(height_map, min_distance=max(1, int(min_peak_dist)),
                                      threshold_abs=fg_thresh * height_map.max(),
                                      labels=blob_mask)
+            if inv_height_map is not None:
+                dark_coords = peak_local_max(inv_height_map, min_distance=max(1, int(min_peak_dist)),
+                                              threshold_abs=fg_thresh * inv_height_map.max(),
+                                              labels=blob_mask)
+                n_bright = len(coords)
+                coords = merge_seed_coords(coords, dark_coords, min_peak_dist)
+
+        # Bright+dark seed merging can over-generate on a small, noisy/textured
+        # blob (confirmed on real footage: a 259px^2 blob produced 7 candidate
+        # seeds for what was visibly ~3 cells). Flooding that many seeds into
+        # too little area produces mostly slivers below min_area, so every
+        # split piece gets dropped and the blob silently falls back to
+        # unsplit -- the extra dark seeds need capping by how much area is
+        # actually there to split. Never cap below n_bright though: that's
+        # exactly what a single-polarity search alone would have kept, and
+        # trimming into it would regress below the pre-dark-search behavior,
+        # not just tame the new addition.
+        if inv_height_map is not None and len(coords) > 1:
+            # min_split_area is a floor for "worth attempting a split at all",
+            # not a real single-cell size estimate (it's deliberately small --
+            # see its default 1.8*min_area), so it under-caps here. A rough
+            # single-cell area of ~8*min_area matches the median real contour
+            # size measured on this footage (min_area=12 -> ~96px^2, vs. the
+            # observed median of ~43-90px^2 across isolated detections).
+            max_seeds = max(1, n_bright, round(area / (8 * min_area)))
+            if len(coords) > max_seeds:
+                coords = coords[:max_seeds]
 
         if est_cell_area:
             expected_count = max(1, round(area / est_cell_area))
@@ -442,6 +501,138 @@ def calibrate_dead_cell_reference(video_path, warmup_start, start_frame, fps, ar
     if not sharpness_vals:
         return None, 0, sampled_s
     return float(np.percentile(sharpness_vals, percentile)), len(sharpness_vals), sampled_s
+
+
+def calibrate_mog2_varThreshold(video_path, warmup_start, start_frame, fps, args,
+                                 candidates=(16.0, 8.0, 4.0, 2.0, 1.0, 0.5),
+                                 oversized_area_mult=40, max_oversized_frac=0.06,
+                                 max_growth_ratio=2.0, growth_smooth_k=3,
+                                 max_aspect_ratio=4.0, max_sliver_frac=0.10,
+                                 sample_s=10.0):
+    """
+    --mog2_varThreshold is a fixed absolute cutoff, and confirmed directly on
+    real footage that the right value is NOT a per-video constant, let alone a
+    global one: the same video's low-contrast region (reference sharpness ~17,
+    see --dead_cell_relative_thresh) needed varThreshold ~1 to detect real
+    cells that a high-contrast region of the same video (reference sharpness
+    ~805) detected fine at varThreshold~4. Lowering varThreshold to recover
+    faint cells always comes at a cost though, and confirmed on real footage
+    that it's not just one cost but three independent ones, so this checks
+    for all three:
+
+    1. Merging: every detected blob's mask gets puffier as varThreshold drops,
+       making touching neighbors more likely to merge into one oversized box
+       (t=100s: varThreshold 4->1 raised detection count 264->294, but raised
+       oversized-box count 12->47, a much bigger relative jump). Caught via
+       the fraction of boxes with area > oversized_area_mult * min_area.
+    2. Sudden noise onset: below some threshold, MOG2 starts flagging
+       flat/featureless background as foreground, producing lots of small
+       non-oversized boxes that (1) can't catch since they're not merged,
+       they're just wrong. Confirmed directly: on a genuinely sparse region,
+       oversized_frac stayed at 0.00 all the way down to varThreshold=0.5
+       even though that setting visually put boxes on plain background with
+       no cell in them at all -- count jumped 17->89 with nothing to show for
+       it. A real cell population grows smoothly as sensitivity increases
+       (t=100s ratios stayed <=1.8x per halving all the way to 0.5); noise
+       onset instead shows a sudden jump (the same sparse region jumped 2.5x,
+       then 4.6x, right at the point confirmed visually to already be noise)
+       -- caught via a smoothed growth-ratio cap between consecutive
+       candidates ((n_new+k)/(n_old+k), the +k damping ratio instability when
+       counts are still tiny).
+    3. Sliver artifacts one or two at a time: distinct from (2) -- these
+       don't show up as a sudden count jump because only 1-2 appear per
+       candidate step, but they're still noise, not cells. Confirmed directly
+       (t=850s, varThreshold 16->2): the 3 real cells at varThreshold=16 were
+       still correctly found at varThreshold=2, but alongside 2 new
+       detections shaped (30x3) and (2x23) px -- extreme aspect ratios no
+       round cell produces. Neither the area check (not oversized) nor the
+       growth-ratio check (3->5 isn't a sudden jump) catches this. Caught via
+       the fraction of boxes whose long/short side ratio exceeds
+       max_aspect_ratio.
+
+    A candidate must pass all three checks to be accepted; sweeps high->low
+    so the lowest (most sensitive) passing candidate wins.
+
+    Deliberately re-decodes+reruns MOG2 once per candidate rather than sharing
+    one decoded-frame cache across all of them: keeps this self-contained and
+    match calibrate_dead_cell_reference's "own instance, MOG2 is stateful"
+    reasoning, at the cost of a few seconds of extra one-time calibration work
+    -- the same tradeoff already accepted there.
+
+    Evaluates detect_cells() on every stride-th frame from start_frame through
+    start_frame+sample_s (not just once at the end of that window) -- a single
+    evaluation frame turned out to be unreliable (confirmed directly: a
+    candidate that looked fine at its window's last frame looked clearly
+    over-merged when independently checked at start_frame itself, because
+    MOG2's model keeps evolving through the sample window, so the endpoint
+    frame doesn't represent the frame this calibration is actually supposed
+    to be representative of). The oversized/sliver fractions are taken as the
+    WORST (max) across evaluated frames, not pooled/averaged together --
+    confirmed directly that averaging lets a bad frame's problem get diluted
+    by cleaner frames elsewhere in the same sample window (sliver_frac 0.29 at
+    the actual target frame vs. a pooled 0.06 across the whole window), which
+    would silently pass a candidate that's bad exactly where it matters.
+    n_detections is still summed across frames (just a rough total, not a
+    pass/fail signal).
+
+    Returns (best_varThreshold, stats_by_candidate) where stats_by_candidate
+    maps each tried value to (n_detections, oversized_frac, sliver_frac,
+    growth_ratio), for the caller to print/log.
+    """
+    sample_end = start_frame + int(sample_s * fps)
+    n_evals = 5  # a handful of spread-out frames, not every frame -- detect_cells (watershed
+                 # splitting) is the expensive step, and 6 candidates x this many evals already
+                 # multiplies calibration cost several-fold over a single-frame check
+    eval_stride = max(1, int(sample_s * fps) // n_evals)
+    stats = {}
+    best = candidates[-1]  # fall back to the most conservative (highest) if none pass
+    prev_n = None
+    for varT in candidates:
+        cap = cv2.VideoCapture(video_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, warmup_start)
+        backsub = cv2.createBackgroundSubtractorMOG2(
+            history=args.mog2_history, varThreshold=varT, detectShadows=False)
+        f = warmup_start
+        total_n = 0
+        frame_fracs = []  # (oversized_frac, sliver_frac) per evaluated frame -- worst-case
+                           # across frames is what gates a candidate, not the pooled average
+                           # (confirmed: pooling let a bad frame's high sliver_frac get diluted
+                           # by cleaner frames elsewhere in the sample window, masking a real
+                           # problem at the specific frame --start_s actually starts counting at)
+        while f < sample_end:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if args.gauss_ksize > 0:
+                k = args.gauss_ksize | 1
+                gray = cv2.GaussianBlur(gray, (k, k), 0)
+            fgm = backsub.apply(gray, learningRate=float(args.learning_rate))
+            _, th = cv2.threshold(fgm, args.mask_thresh, 255, cv2.THRESH_BINARY)
+            if f >= start_frame and (f - start_frame) % eval_stride == 0:
+                _, _, boxes = detect_cells(th, frame, gray, args, fg_thresh=args.watershed_fg_thresh,
+                                            min_peak_dist=args.watershed_min_peak_dist,
+                                            prominence_frac=args.watershed_prominence_frac)
+                n = len(boxes)
+                total_n += n
+                oversized = sum(1 for (x, y, w, h, is_s, is_dead) in boxes
+                                 if w * h > oversized_area_mult * args.min_area)
+                sliver = sum(1 for (x, y, w, h, is_s, is_dead) in boxes
+                             if max(w, h) > max_aspect_ratio * max(1, min(w, h)))
+                frame_fracs.append((oversized / n if n else 0.0, sliver / n if n else 0.0))
+            f += 1
+        cap.release()
+        oversized_frac = max((of for of, sf in frame_fracs), default=0.0)
+        sliver_frac = max((sf for of, sf in frame_fracs), default=0.0)
+        growth = ((total_n + growth_smooth_k) / (prev_n + growth_smooth_k)
+                  if prev_n is not None else 1.0)
+        stats[varT] = (total_n, oversized_frac, sliver_frac, growth)
+        if (oversized_frac <= max_oversized_frac and sliver_frac <= max_sliver_frac
+                and growth < max_growth_ratio):
+            best = varT  # candidates iterate high->low, so last passing one is lowest/most sensitive
+        prev_n = total_n
+
+    return best, stats
 
 
 def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prominence_frac=None,
@@ -897,6 +1088,15 @@ def main():
 
     ap.add_argument("--mog2_history",      type=int,   default=500)
     ap.add_argument("--mog2_varThreshold", type=float, default=16)
+    ap.add_argument("--auto_mog2_varThreshold", action="store_true",
+                    help="Auto-calibrate --mog2_varThreshold instead of using a fixed number "
+                         "(overrides --mog2_varThreshold if both are given). Confirmed the right "
+                         "value is not even a per-video constant, let alone a global default -- "
+                         "it needs to track how faint real cells are against the background in "
+                         "this specific run's footage. Sweeps a few candidate values on a "
+                         "throwaway calibration pass and picks the most sensitive one (best at "
+                         "catching faint cells) that doesn't push too many detections into "
+                         "oversized/likely-merged boxes. See calibrate_mog2_varThreshold().")
     ap.add_argument("--learning_rate",     type=float, default=0.0005)
     ap.add_argument("--mask_thresh",       type=int,   default=60)
     ap.add_argument("--gauss_ksize",       type=int,   default=3)
@@ -1103,6 +1303,11 @@ def main():
                     help="Dilate edges by this many px before subtracting from mask. "
                          "1 = thin barrier, 2 = thicker. Default 1.")
     ap.add_argument("--draw_detections",action="store_true")
+    ap.add_argument("--label_detections", action="store_true",
+                    help="With --draw_detections, also number each detection box "
+                         "(0, 1, 2, ... in det_boxes order for that frame) so a specific "
+                         "box can be pointed at by number in feedback/review instead of "
+                         "by pixel coordinates.")
     args = ap.parse_args()
 
     if args.use_watershed_split and not HAS_SKIMAGE:
@@ -1141,6 +1346,17 @@ def main():
                   f"(p75 of {n_samples} real detections over {sampled_s:.0f}s) = {ref:.1f}, "
                   f"--dead_cell_relative_thresh {args.dead_cell_relative_thresh:g} -> "
                   f"effective cutoff = {args.dead_cell_max_sharpness:.1f}")
+
+    if args.auto_mog2_varThreshold:
+        best_varT, stats = calibrate_mog2_varThreshold(
+            args.video, warmup_start, start_frame, fps, args)
+        args.mog2_varThreshold = best_varT
+        print("Auto-calibrated --mog2_varThreshold for this video/run:")
+        for varT in sorted(stats, reverse=True):
+            n, oversized_frac, sliver_frac, growth = stats[varT]
+            flag = " <- selected" if varT == best_varT else ""
+            print(f"  varThreshold={varT:g}: n_detections={n}, oversized_frac={oversized_frac:.2f}, "
+                  f"sliver_frac={sliver_frac:.2f}, growth_vs_prev={growth:.2f}{flag}")
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, warmup_start)
     ret, frame0 = cap.read()
@@ -1481,9 +1697,12 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX,0.45,(255,255,255),1)
 
             if args.draw_detections:
-                for (x,y,w,h,is_s,is_dead) in det_boxes:
+                for i, (x,y,w,h,is_s,is_dead) in enumerate(det_boxes):
                     col = (0,0,255) if is_dead else ((0,255,255) if is_s else (255,0,255))
                     cv2.rectangle(left,(x,y),(x+w,y+h),col,1)
+                    if args.label_detections:
+                        cv2.putText(left,str(i),(x,y-3),
+                                    cv2.FONT_HERSHEY_SIMPLEX,0.35,col,1)
 
             for tid,st in tracks.items():
                 dead = st["dead_count"] * 2 >= st["seen_count"]
