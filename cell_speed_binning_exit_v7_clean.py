@@ -61,7 +61,7 @@ def hungarian_match(tracks, detections, max_dist):
         for tid in tids:
             st = tracks[tid]
             best_j, best_d = None, 1e9
-            for j, (cx, cy, _) in enumerate(detections):
+            for j, (cx, cy, *_rest) in enumerate(detections):
                 if j in used:
                     continue
                 d = math.hypot(cx - st["cx"], cy - st["cy"])
@@ -76,7 +76,7 @@ def hungarian_match(tracks, detections, max_dist):
     cost = np.full((n_t, n_d), INF, dtype=np.float64)
     for i, tid in enumerate(tids):
         st = tracks[tid]
-        for j, (cx, cy, _) in enumerate(detections):
+        for j, (cx, cy, *_rest) in enumerate(detections):
             d = math.hypot(cx - st["cx"], cy - st["cy"])
             if d <= max_dist:
                 cost[i, j] = d
@@ -180,9 +180,38 @@ def estimate_merged_seeds(blob_mask, height_map, expected_count):
     return np.array(seeds)
 
 
+def find_outer_contours(mask, want_hole_flag=False):
+    """
+    cv2.findContours with RETR_EXTERNAL, optionally also reporting whether each
+    outer contour has an internal hole (a child contour in RETR_CCOMP's
+    hierarchy). A hole means the mask is a ring/donut, not a filled disk --
+    confirmed on real footage to happen for cells whose interior is dark enough
+    to be indistinguishable from the learned MOG2 background (only the bright
+    halo rim deviates enough to be flagged foreground), unlike ordinary live
+    cells whose whole body reads as foreground. Used to identify that subset
+    without a brightness threshold, which swept up far too many normal (dim)
+    detections when tried (see --exclude_hole_blobs).
+    """
+    if not want_hole_flag:
+        cs, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return [(c, False) for c in cs]
+    cs, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return []
+    hierarchy = hierarchy[0]
+    out = []
+    for i, c in enumerate(cs):
+        _, _, child, parent = hierarchy[i]
+        if parent != -1:
+            continue  # this is a hole itself, not a blob -- skip, its parent covers it
+        out.append((c, child != -1))
+    return out
+
+
 def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_split_area,
                               min_peak_dist, prominence_frac=None, gray=None,
-                              use_intensity_peaks=False, est_cell_area=None):
+                              use_intensity_peaks=False, est_cell_area=None,
+                              exclude_hole_blobs=False):
     """
     Split touching/overlapping cells using a distance-transform watershed.
 
@@ -214,7 +243,7 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
     """
     mask = binary_mask.copy()
     _, mask = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY)
-    raw_contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    raw_contours = find_outer_contours(mask, want_hole_flag=True)
 
     # Returns (contour, seed_xy) pairs. seed_xy is the exact peak pixel for a split
     # cell (the true, accurate cell center); None for a pass-through unsplit contour,
@@ -224,14 +253,24 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
     # overlapping unevenly) produces a lopsided region whose centroid can land
     # noticeably off the real cell, especially visible for close/touching pairs.
     out = []
-    for rc in raw_contours:
+    for rc, has_hole in raw_contours:
         area = cv2.contourArea(rc)
         if area < min_area:
             continue
+        # A hole only marks a single dead cell if the blob stays a single,
+        # unsplit object below -- gating the drop here instead of upfront
+        # matters because several live cells clustered around an incidental
+        # gap can also produce a mask with a hole, and splitting would still
+        # correctly recover them as separate real cells. Excluding upfront
+        # would silently drop that whole cluster instead. has_hole itself is
+        # always carried through (even when not dropping) so callers can tag
+        # a detection as a likely dead cell without discarding it.
+        drop_if_unsplit = exclude_hole_blobs and has_hole
 
         # small blobs → single cell, skip splitting
         if area < min_split_area:
-            out.append((rc, None))
+            if not drop_if_unsplit:
+                out.append((rc, None, has_hole))
             continue
 
         # isolate blob
@@ -240,7 +279,8 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
 
         dist = cv2.distanceTransform(blob_mask, cv2.DIST_L2, 5)
         if dist.max() <= 0:
-            out.append((rc, None))
+            if not drop_if_unsplit:
+                out.append((rc, None, has_hole))
             continue
 
         if use_intensity_peaks and gray is not None:
@@ -263,7 +303,8 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
 
         if len(coords) <= 1:
             # only one cell center found → single cell
-            out.append((rc, None))
+            if not drop_if_unsplit:
+                out.append((rc, None, has_hole))
             continue
 
         peak_mask = np.zeros(dist.shape, dtype=bool)
@@ -283,13 +324,48 @@ def split_contours_watershed(binary_mask, frame_bgr, fg_thresh, min_area, min_sp
             cs, _ = cv2.findContours(obj, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for c in cs:
                 if cv2.contourArea(c) >= min_area:
-                    out.append((c, label_to_seed.get(label)))
+                    # a piece from an actual multi-seed split is a recovered real
+                    # cell, not the dead-cell signature -- never tag it as one
+                    out.append((c, label_to_seed.get(label), False))
                     split_any = True
 
-        if not split_any:
-            out.append((rc, None))
+        if not split_any and not drop_if_unsplit:
+            out.append((rc, None, has_hole))
 
     return out
+
+
+def local_blob_sharpness(gray, cx, cy, radius):
+    """
+    Laplacian variance (a standard focus/blur metric) in a small patch around
+    (cx, cy) on an unblurred grayscale image -- low variance = few sharp edges
+    = blurry. This is the dead-cell signature confirmed directly against
+    user-labeled examples (t=280s, detections 143/13/17/43/113/118/34): unlike
+    the sharp, high-contrast bright-halo ring of a live cell, these show up as
+    a soft, blurred, halo-less dark blob -- consistent with sitting outside the
+    imaging focal plane (e.g. settled to the channel floor) rather than flowing
+    through it. Replaces an earlier mask-hole-based guess the user directly
+    confirmed was wrong (none of the 7 labeled examples had a mask hole).
+
+    Returns None if the patch would be clipped by the frame border -- confirmed
+    to read as artificially uniform/low-variance there too, which would wrongly
+    flag real edge-of-frame cells as dead.
+
+    NOTE: the raw variance's absolute scale does drift some between frames
+    (confirmed: an earlier, lower-density timepoint measured a lower median
+    than a later, denser one), which is why --dead_cell_max_sharpness needed
+    retuning (550 -> 450) once checked against a second timepoint. A per-frame
+    relative/percentile threshold was tried as a fix but rejected: the user
+    confirmed a frame can legitimately be mostly dead, which a percentile rank
+    can never express since it always tags close to the requested percentile
+    regardless of the true proportion. See --dead_cell_max_sharpness.
+    """
+    y0, y1 = cy - radius, cy + radius
+    x0, x1 = cx - radius, cx + radius
+    if y0 < 0 or x0 < 0 or y1 > gray.shape[0] or x1 > gray.shape[1]:
+        return None
+    patch = gray[y0:y1, x0:x1].astype(np.float64)
+    return cv2.Laplacian(patch, cv2.CV_64F).var()
 
 
 def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prominence_frac=None,
@@ -314,14 +390,27 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prom
                                             prominence_frac=prominence_frac,
                                             gray=gray,
                                             use_intensity_peaks=args.watershed_use_intensity,
-                                            est_cell_area=args.watershed_est_cell_area)
+                                            est_cell_area=args.watershed_est_cell_area,
+                                            exclude_hole_blobs=args.exclude_hole_blobs)
     else:
-        cs, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contour_seed_pairs = [(c, None) for c in cs]
+        cs_holes = find_outer_contours(th, want_hole_flag=True)
+        contour_seed_pairs = [(c, None, has_hole) for c, has_hole in cs_holes
+                               if not (args.exclude_hole_blobs and has_hole)]
 
-    detections = []
-    det_boxes  = []
-    for c, seed in contour_seed_pairs:
+    # gray is Gaussian-blurred upstream (for MOG2/mask purposes) -- that smoothing
+    # destroys exactly the high-frequency edge content the blur/sharpness dead-cell
+    # signal depends on (confirmed: measuring on the blurred gray reads almost
+    # every detection as "blurry", not just the true dead cells). Recompute an
+    # unblurred grayscale from the raw frame instead, once per call, only when
+    # actually needed.
+    want_sharpness = args.dead_cell_max_sharpness is not None or args.dead_cell_percentile is not None
+    sharp_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if want_sharpness else None
+
+    # Staged first pass: gather everything except the dead-cell tag, since
+    # --dead_cell_percentile needs every candidate's sharpness collected before
+    # it can rank them against each other (see below).
+    staged = []
+    for c, seed, _has_hole in contour_seed_pairs:
         area = cv2.contourArea(c)
         if area < args.min_area or area > args.max_area:
             continue
@@ -357,9 +446,35 @@ def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prom
                       and area >= args.streak_min_area
                       and long_axis >= args.streak_min_len
                       and long_axis/short_axis >= args.streak_ar)
-        detections.append((cx, cy, is_streak))
-        det_boxes.append((x, y, w, h, is_streak))
-    return [c for c, _ in contour_seed_pairs], detections, det_boxes
+        sharpness = local_blob_sharpness(sharp_gray, cx, cy, args.dead_cell_sharpness_radius) \
+                    if sharp_gray is not None else None
+        staged.append((cx, cy, is_streak, x, y, w, h, sharpness))
+
+    # --dead_cell_percentile ranks each detection against this frame's own
+    # sharpness distribution instead of a fixed absolute cutoff -- confirmed
+    # necessary on real footage: a whole frame's baseline sharpness can differ
+    # enough between timepoints (an earlier, lower-density frame measured
+    # roughly half the median variance of a later, denser one) that a single
+    # fixed --dead_cell_max_sharpness value either over-flagged real live cells
+    # (sparse/dim frame) or under-flagged real dead ones (dense/sharp frame).
+    percentile_cutoff = None
+    if args.dead_cell_percentile is not None:
+        valid = [s[7] for s in staged if s[7] is not None]
+        if valid:
+            percentile_cutoff = np.percentile(valid, args.dead_cell_percentile)
+
+    detections = []
+    det_boxes  = []
+    for cx, cy, is_streak, x, y, w, h, sharpness in staged:
+        is_dead = False
+        if sharpness is not None:
+            if percentile_cutoff is not None:
+                is_dead = sharpness < percentile_cutoff
+            elif args.dead_cell_max_sharpness is not None:
+                is_dead = sharpness < args.dead_cell_max_sharpness
+        detections.append((cx, cy, is_streak, is_dead))
+        det_boxes.append((x, y, w, h, is_streak, is_dead))
+    return [c for c, _, _ in contour_seed_pairs], detections, det_boxes
 
 
 def print_blob_size_diagnostics(th, args):
@@ -466,8 +581,9 @@ def save_preview(th, frame, gray, args, raw_diff=None):
                                              raw_diff=raw_diff, **make_kwargs(row_val))
             print(f"{fg:>10.2f} {row_val:>16.2f} {len(detections):>6}")
             tile = frame.copy()
-            for i, (cx, cy, _is_streak) in enumerate(detections):
-                cv2.circle(tile, (cx, cy), 3, (0, 255, 0), -1)
+            for i, (cx, cy, _is_streak, is_dead) in enumerate(detections):
+                col = (0, 0, 255) if is_dead else (0, 255, 0)
+                cv2.circle(tile, (cx, cy), 3, col, -1)
                 cv2.putText(tile, str(i + 1), (cx + 4, cy - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
             cv2.putText(tile, f"fg={fg:g} {row_label[:4]}={row_val:g} n={len(detections)}",
@@ -595,6 +711,18 @@ def main():
     ap.add_argument("--speed_bins", required=True)
     ap.add_argument("--m_per_px", type=float, default=None)
     ap.add_argument("--fps",      type=float, default=None)
+    ap.add_argument("--frame_stride", type=int, default=1,
+                    help="Only fully process 1 out of every N frames (default 1 = every "
+                         "frame); the other N-1 are cheaply skipped via cap.grab() (no "
+                         "decode, no MOG2, no tracking), cutting runtime roughly N-fold on "
+                         "high-fps footage that oversamples relative to how fast cells "
+                         "actually move. Frame indices (and therefore all time/speed math) "
+                         "stay in true video time -- only the gap between frames the "
+                         "tracker actually sees grows, so --max_dist likely needs "
+                         "increasing by roughly the same factor N or fast cells will "
+                         "fragment into multiple short tracks instead of one. Verify cell "
+                         "counts are stable before/after enabling this (--preview_frame_s) "
+                         "rather than assuming it's free.")
 
     ap.add_argument("--min_area",   type=float, default=12)
     ap.add_argument("--max_area",   type=float, default=8000)
@@ -613,6 +741,54 @@ def main():
                          "not worth it given this assay specifically cares about slower/dimmer "
                          "cells. Use --preview_frame_s to check a value against a real frame "
                          "before committing to a full run if you want to revisit this.")
+    ap.add_argument("--exclude_hole_blobs", action="store_true",
+                    help="Exclude blobs whose foreground mask has a hole (a donut/ring shape: "
+                         "solid bright rim, unflagged interior) instead of being a filled disk. "
+                         "NOTE: this was originally built as a dead-cell detector but the user "
+                         "directly confirmed on real labeled examples that it's wrong for that -- "
+                         "none of 7 user-identified dead cells at t=280s had a mask hole. Kept as "
+                         "a narrow, independent shape/topology filter (still legitimately finds "
+                         "blobs with an unflagged interior), just no longer tied to dead-cell "
+                         "classification. See --dead_cell_max_sharpness for the actual dead-cell "
+                         "signal. Off by default.")
+    ap.add_argument("--dead_cell_max_sharpness", type=float, default=None,
+                    help="Tag a detection as a dead cell if the Laplacian variance (a standard "
+                         "focus/blur metric), measured on the raw unblurred frame (not the "
+                         "Gaussian-smoothed gray used for MOG2 -- that smoothing was confirmed to "
+                         "wash out this signal almost entirely, reading nearly everything as "
+                         "'blurry'), in a small patch around its center is below this FIXED value. "
+                         "This is the recommended mode -- --dead_cell_percentile (below) was tried "
+                         "first but rejected: it ranks within each frame and so mechanically forces "
+                         "a fixed tag rate everywhere, which cannot represent a real frame where "
+                         "most cells actually are dead (confirmed: the user identified t=90s as "
+                         "mostly-dead-except-two, which a percentile-based rank can never output). "
+                         "Try 450 as a starting point for this footage -- confirmed against 7 "
+                         "user-labeled dead cells (t=280s, 5/7 tagged) and 2 user-confirmed-alive "
+                         "cells at t=90s that a higher value (550) wrongly caught (both correctly "
+                         "excluded at 450, while still tagging ~75%% of that frame as dead, matching "
+                         "the user's own read of it). Tags only (see is_dead_cell in "
+                         "--per_object_csv and dead_cell_count in --out_csv); does not exclude "
+                         "anything from the count. Default None = disabled. Ignored if "
+                         "--dead_cell_percentile is also set.")
+    ap.add_argument("--dead_cell_percentile", type=float, default=None,
+                    help="Tag a detection as a dead cell if its Laplacian variance (see "
+                         "--dead_cell_max_sharpness for what this measures and why) falls below "
+                         "this percentile (0-100) of all detections in the SAME frame, instead of "
+                         "a fixed absolute value. NOT recommended -- tried this to fix "
+                         "--dead_cell_max_sharpness's cross-frame drift problem, but the user then "
+                         "confirmed a frame can legitimately be mostly-dead (t=90s, ~75%% dead by "
+                         "their own read), which ranking within the frame can never express since "
+                         "it always tags close to the requested percentile regardless of the true "
+                         "proportion. Kept available in case a use case genuinely wants relative "
+                         "ranking, but --dead_cell_max_sharpness is the validated default choice. "
+                         "Tags only, does not exclude anything. Default None = disabled.")
+    ap.add_argument("--dead_cell_sharpness_radius", type=int, default=8,
+                    help="Patch half-size (px) for the dead-cell Laplacian variance measurement "
+                         "(--dead_cell_max_sharpness / --dead_cell_percentile). Default 8, matched "
+                         "to this footage's cell size -- a patch much smaller than one cell mixes "
+                         "in background noise, much larger mixes in neighboring cells (confirmed "
+                         "to inflate the score and mask the signal on a cell sitting next to a "
+                         "bright neighbor).")
     ap.add_argument("--min_local_motion", type=float, default=0.0,
                     help="Minimum mean frame-to-frame pixel difference (0-255) in a small "
                          "window around a detected cell's position for it to count. Rejects "
@@ -859,6 +1035,7 @@ def main():
     counts             = defaultdict(int)
     streak_only_counts = defaultdict(int)
     short_track_counts = defaultdict(int)
+    dead_cell_counts   = defaultdict(int)
     per_rows = []
 
     vw = None
@@ -939,6 +1116,14 @@ def main():
             bucket = streak_only_counts if st["is_streak"] else short_track_counts
             bucket[tb] += 1
             counted_as = "streak_only_short" if st["is_streak"] else "short_track"
+        # Majority vote across the track's own lifetime, not just its last frame --
+        # a cell that measured as blurry (see --dead_cell_max_sharpness) in most
+        # of the frames it was seen in is classified as a dead cell here, tagged
+        # alongside (not instead of) its speed-bin/streak/short bucket above,
+        # since live/dead is a separate dimension from how it was counted.
+        is_dead_cell = st["dead_count"] * 2 >= st["seen_count"]
+        if is_dead_cell:
+            dead_cell_counts[tb] += 1
         # Always record a per_rows entry regardless of which bucket it landed in --
         # short_track/streak cells are the ones most likely to be noise (only tracked
         # a frame or two), so they're exactly the ones worth being able to verify,
@@ -947,6 +1132,7 @@ def main():
             per_rows.append(dict(
                 track_id=tid, final_reason=reason, counted_as=counted_as,
                 seen_count=st["seen_count"], is_streak=int(st["is_streak"]),
+                is_dead_cell=int(is_dead_cell),
                 speed=v, speed_unit="m/s" if args.m_per_px else "px/s",
                 time_exit_s_abs=t_abs, time_exit_s_rel=t_rel,
                 x_exit=x_e, y_exit=y_e))
@@ -955,6 +1141,21 @@ def main():
     while True:
         if end_frame_excl is not None and abs_frame >= end_frame_excl:
             break
+        # --frame_stride cheaply skips decode+MOG2+tracking entirely on frames that
+        # aren't a multiple of the stride away from warmup_start, via cap.grab()
+        # (discards the frame without decoding it -- far cheaper than cap.read(),
+        # which is the actual dominant cost being cut here). abs_frame still counts
+        # every real frame at the video's true fps, so all time/speed math (which
+        # is frame-index-based, not loop-iteration-based) stays correct unchanged;
+        # only the effective time gap between *processed* frames grows, which is
+        # why --max_dist likely needs increasing roughly proportionally to
+        # --frame_stride (a cell now moves stride-times further between the frames
+        # the tracker actually sees).
+        if args.frame_stride > 1 and (abs_frame - warmup_start) % args.frame_stride != 0:
+            if not cap.grab():
+                break
+            abs_frame += 1
+            continue
         ret, frame = cap.read()
         if not ret or frame is None:
             break
@@ -1054,7 +1255,7 @@ def main():
         pairs, unmatched = hungarian_match(tracks, detections, args.max_dist)
 
         for tid, j in pairs:
-            cx, cy, is_streak = detections[j]
+            cx, cy, is_streak, is_dead = detections[j]
             st = tracks[tid]
             st["cx"], st["cy"] = cx, cy
             st["last_seen_frame"] = cur_frame
@@ -1062,10 +1263,11 @@ def main():
             st["missed_count"] = 0
             st["updated"]      = True
             st["is_streak"]    = st["is_streak"] or is_streak
+            st["dead_count"]  += 1 if is_dead else 0
             st["end_x"], st["end_y"] = cx, cy
 
         for j in unmatched:
-            cx, cy, is_streak = detections[j]
+            cx, cy, is_streak, is_dead = detections[j]
             if args.enable_streak and is_streak:
                 while (recent_streaks
                        and cur_frame - recent_streaks[0][0] > args.streak_merge_window):
@@ -1077,6 +1279,7 @@ def main():
             tracks[next_id] = dict(
                 cx=cx, cy=cy, first_frame=cur_frame, last_seen_frame=cur_frame,
                 seen_count=1, missed_count=0, is_streak=bool(is_streak),
+                dead_count=1 if is_dead else 0,
                 updated=True, start_x=cx, start_y=cy, end_x=cx, end_y=cy)
             next_id += 1
 
@@ -1122,12 +1325,13 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX,0.45,(255,255,255),1)
 
             if args.draw_detections:
-                for (x,y,w,h,is_s) in det_boxes:
-                    col = (0,255,255) if is_s else (255,0,255)
+                for (x,y,w,h,is_s,is_dead) in det_boxes:
+                    col = (0,0,255) if is_dead else ((0,255,255) if is_s else (255,0,255))
                     cv2.rectangle(left,(x,y),(x+w,y+h),col,1)
 
             for tid,st in tracks.items():
-                col = (0,255,0) if not st["is_streak"] else (0,255,255)
+                dead = st["dead_count"] * 2 >= st["seen_count"]
+                col = (0,0,255) if dead else ((0,255,0) if not st["is_streak"] else (0,255,255))
                 cv2.circle(left,(st["cx"],st["cy"]),3,col,-1)
                 cv2.putText(left,str(tid),(st["cx"]+4,st["cy"]-4),
                             cv2.FONT_HERSHEY_SIMPLEX,0.4,(255,255,255),1)
@@ -1175,7 +1379,7 @@ def main():
               + [f"{edges[-1]}_inf"])
     cols = (["time_start_s","time_end_s"]
             + [f"speedbin_{l}" for l in labels]
-            + ["streak_only_short","short_track","total_counted"])
+            + ["streak_only_short","short_track","total_counted","dead_cell_count"])
 
     rows = []
     for tb in range(max_tb+1):
@@ -1185,7 +1389,10 @@ def main():
             c=counts.get((tb,sb),0); row.append(c); tot+=c
         c=counts.get((tb,len(edges)-1),0); row.append(c); tot+=c
         cs=streak_only_counts.get(tb,0); ch=short_track_counts.get(tb,0)
-        row+=[cs,ch,tot+cs+ch]; rows.append(row)
+        # dead_cell_count is a tag on cells already included in the counts above
+        # (a subset, not an additional population) -- do not add it into totals.
+        dc=dead_cell_counts.get(tb,0)
+        row+=[cs,ch,tot+cs+ch,dc]; rows.append(row)
 
     df = pd.DataFrame(rows, columns=cols)
     sc = [c for c in df.columns if c.startswith("speedbin_")]
