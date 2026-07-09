@@ -12,7 +12,7 @@ v7_clean — back to v7 base that worked best, with two additions:
   All other v7 logic preserved exactly.
 """
 
-import argparse, math
+import argparse, math, os
 from collections import deque, defaultdict
 import cv2
 import numpy as np
@@ -1764,6 +1764,13 @@ def main():
                     if near_exit(st["cx"], st["cy"], args.end_of_range_margin_px):
                         t_abs = st["last_seen_frame"] / fps
                         finalize_track(t_abs, t_abs-start_s, st, tid, "missing")
+                    elif os.environ.get("DEBUG_TRACK_DROPS") and st["seen_count"] >= 5:
+                        dx = st["end_x"] - st["start_x"]; dy = st["end_y"] - st["start_y"]
+                        dur = (st["last_seen_frame"] - st["first_frame"]) / fps
+                        print(f"DROP tid={tid} seen={st['seen_count']} dur={dur:.1f}s "
+                              f"start=({st['start_x']},{st['start_y']}) "
+                              f"end=({st['end_x']},{st['end_y']}) d=({dx},{dy}) "
+                              f"last_t={st['last_seen_frame']/fps:.1f}s", flush=True)
                     tracks.pop(tid, None)
 
         if vw is not None:
