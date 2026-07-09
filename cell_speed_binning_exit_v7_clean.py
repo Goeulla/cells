@@ -1022,30 +1022,6 @@ def main():
         raise SystemExit(f"Cannot open: {args.video}")
     fps = args.fps or cap.get(cv2.CAP_PROP_FPS) or 30.0
 
-    # A cell lingering in the exit margin (e.g. a real, slow adhesion-interacting cell
-    # creeping along the boundary, not just flowing straight through) gets its track
-    # destroyed and recreated every processed frame -- each recreation immediately
-    # re-satisfies crossed_exit and would be finalized as a brand-new crossing if not
-    # for is_duplicate_exit's dedup_window. But dedup_window is a fixed wall-clock
-    # duration, while --frame_stride widens the real gap between processed frames
-    # (frame_stride/fps seconds apart, not 1/fps) -- if dedup_window is shorter than
-    # that gap, the previous exit's dedup entry has already "expired" by the time the
-    # next frame's re-detection of the SAME lingering cell arrives, so it looks like a
-    # brand-new cell every single frame. Confirmed directly: a real slow-rolling cell
-    # produced 29 separate passed_line counts spaced almost exactly frame_stride/fps
-    # apart, instead of 1. Auto-raise dedup_window to a safe floor above that gap
-    # rather than silently under-count -- or rather, silently over-count -- whenever
-    # --frame_stride makes the default (tuned for stride=1) too short.
-    frame_period = args.frame_stride / fps
-    dedup_floor  = 1.5 * frame_period
-    if args.dedup_window < dedup_floor:
-        print(f"NOTE: --dedup_window ({args.dedup_window:g}s) is shorter than 1.5x the gap "
-              f"between processed frames at --frame_stride {args.frame_stride:g} "
-              f"({frame_period:.3f}s/frame) -- a cell lingering in the exit margin across "
-              f"multiple frames could get re-counted as a new crossing every frame. "
-              f"Auto-raising --dedup_window to {dedup_floor:.3f}s.")
-        args.dedup_window = dedup_floor
-
     start_s     = max(0.0, args.start_s)
     start_frame = int(start_s * fps)
     end_frame_excl = int(args.end_s * fps) if args.end_s else None
@@ -1315,7 +1291,28 @@ def main():
             for tid in tracks:
                 tracks[tid]["updated"] = False
 
-            pairs, unmatched = hungarian_match(tracks, detections, args.max_dist)
+            # Match not-yet-counted tracks first, using the normal generous max_dist
+            # (needed for legitimate fast whole-frame movement). Already-counted
+            # tracks (kept alive so a lingering object doesn't respawn a fresh ID,
+            # see below) only get a second, much tighter shot at whatever detections
+            # are left over -- using dedup_dist, not max_dist -- so a counted track
+            # can still re-claim ITS OWN still-barely-moving object next frame, but
+            # can't silently absorb a genuinely different, unrelated cell that
+            # happens to arrive nearby later. Confirmed this matters: letting counted
+            # tracks keep matching at the full max_dist=500 made distinct cells at a
+            # busy exit chokepoint silently vanish into an already-counted track
+            # instead of being counted themselves.
+            uncounted = {tid: st for tid, st in tracks.items() if not st["counted"]}
+            counted   = {tid: st for tid, st in tracks.items() if st["counted"]}
+
+            pairs, unmatched = hungarian_match(uncounted, detections, args.max_dist)
+
+            if counted and unmatched:
+                leftover_idx = sorted(unmatched)
+                leftover_det = [detections[j] for j in leftover_idx]
+                pairs2, unmatched2 = hungarian_match(counted, leftover_det, args.dedup_dist)
+                pairs += [(tid, leftover_idx[j]) for tid, j in pairs2]
+                unmatched = {leftover_idx[j] for j in unmatched2}
 
             for tid, j in pairs:
                 cx, cy, is_streak, is_dead = detections[j]
@@ -1342,18 +1339,30 @@ def main():
                 tracks[next_id] = dict(
                     cx=cx, cy=cy, first_frame=cur_frame, last_seen_frame=cur_frame,
                     seen_count=1, missed_count=0, is_streak=bool(is_streak),
-                    dead_count=1 if is_dead else 0,
+                    dead_count=1 if is_dead else 0, counted=False,
                     updated=True, start_x=cx, start_y=cy, end_x=cx, end_y=cy)
                 next_id += 1
 
-            to_del = []
+            # Mark counted rather than deleting on crossing -- a cell that lingers in
+            # the exit margin for many frames (e.g. a real, slow adhesion-interacting
+            # cell creeping along the boundary, not just flowing straight through)
+            # would otherwise have its track destroyed here and immediately recreated
+            # as a brand-new "unmatched" detection next frame, re-triggering this same
+            # crossing check and getting finalized again -- confirmed directly: one
+            # slow-rolling cell produced 29 separate passed_line counts instead of 1.
+            # Keeping the track alive (still updated by ordinary Hungarian matching
+            # each frame) means the same physical object keeps the same ID and can
+            # only ever pass this check once; it's removed later by the normal
+            # missed-timeout path below once it actually stops being detected, not
+            # re-finalized (guarded by "counted" there too). Tried widening
+            # --dedup_window instead first -- that failed: at a busy exit chokepoint
+            # it also merged genuinely distinct fast cells that happened to exit
+            # through the same spot soon after, undercounting real crossings.
             for tid, st in tracks.items():
-                if crossed_exit(st["cx"], st["cy"]):
+                if not st["counted"] and crossed_exit(st["cx"], st["cy"]):
                     t_abs = st["last_seen_frame"] / fps
-                    finalize_track(t_abs, t_abs-start_s, st, tid, "passed_line")
-                    to_del.append(tid)
-            for tid in to_del:
-                tracks.pop(tid, None)
+                    if finalize_track(t_abs, t_abs-start_s, st, tid, "passed_line"):
+                        st["counted"] = True
 
             for tid, st in list(tracks.items()):
                 if not st["updated"]:
@@ -1367,7 +1376,7 @@ def main():
                         # dropped, not counted as a cell that passed the FOV. Confirmed via
                         # --verify_crossings_out: a "missing" cell counted near the bottom
                         # of a "top"-exit frame, nowhere near the boundary.
-                        if near_exit(st["cx"], st["cy"], args.end_of_range_margin_px):
+                        if not st["counted"] and near_exit(st["cx"], st["cy"], args.end_of_range_margin_px):
                             t_abs = st["last_seen_frame"] / fps
                             finalize_track(t_abs, t_abs-start_s, st, tid, "missing")
                         tracks.pop(tid, None)
@@ -1400,18 +1409,17 @@ def main():
                 line_tracks[next_line_id] = dict(
                     cx=cx, cy=cy, first_frame=cur_frame, last_seen_frame=cur_frame,
                     seen_count=1, missed_count=0, is_streak=bool(is_streak),
-                    dead_count=1 if is_dead else 0,
+                    dead_count=1 if is_dead else 0, counted=False,
                     updated=True, start_x=cx, start_y=cy, end_x=cx, end_y=cy)
                 next_line_id += 1
 
-            to_del = []
+            # Same "mark counted, don't delete on crossing" fix as the full-frame
+            # tracker above -- see that comment for why.
             for tid, st in line_tracks.items():
-                if crossed_exit(st["cx"], st["cy"]):
+                if not st["counted"] and crossed_exit(st["cx"], st["cy"]):
                     t_abs = st["last_seen_frame"] / fps
-                    finalize_track(t_abs, t_abs-start_s, st, tid, "passed_line")
-                    to_del.append(tid)
-            for tid in to_del:
-                line_tracks.pop(tid, None)
+                    if finalize_track(t_abs, t_abs-start_s, st, tid, "passed_line"):
+                        st["counted"] = True
 
             for tid, st in list(line_tracks.items()):
                 if not st["updated"]:
@@ -1422,7 +1430,7 @@ def main():
                         # when it dropped out (e.g. lost right at the edge); otherwise
                         # it never demonstrated it was really exiting (could be a cell
                         # that entered the band and drifted back) and is dropped.
-                        if near_exit(st["cx"], st["cy"], args.end_of_range_margin_px):
+                        if not st["counted"] and near_exit(st["cx"], st["cy"], args.end_of_range_margin_px):
                             t_abs = st["last_seen_frame"] / fps
                             finalize_track(t_abs, t_abs-start_s, st, tid, "missing")
                         line_tracks.pop(tid, None)
@@ -1476,7 +1484,7 @@ def main():
         t_abs_end = last_processed / fps
         active_tracks = line_tracks if args.count_at_line else tracks
         for tid, st in list(active_tracks.items()):
-            if near_exit(st["cx"], st["cy"], args.end_of_range_margin_px):
+            if not st["counted"] and near_exit(st["cx"], st["cy"], args.end_of_range_margin_px):
                 finalize_track(t_abs_end, t_abs_end - start_s, st, tid, "end_of_range")
         active_tracks.clear()
 
