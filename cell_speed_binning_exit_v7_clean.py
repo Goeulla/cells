@@ -1714,6 +1714,11 @@ def main():
         for tid, j in pairs:
             cx, cy, is_streak, is_dead = detections[j]
             st = tracks[tid]
+            if os.environ.get("DEBUG_TRACK_PATH") and st["seen_count"] >= 15:
+                step_d = math.hypot(cx - st["cx"], cy - st["cy"])
+                print(f"PATH tid={tid} t={cur_frame/fps:.2f}s pos=({cx},{cy}) "
+                      f"step_from_prev=({cx-st['cx']},{cy-st['cy']}) step_d={step_d:.1f} "
+                      f"seen={st['seen_count']}", flush=True)
             st["cx"], st["cy"] = cx, cy
             st["last_seen_frame"] = cur_frame
             st["seen_count"]  += 1
