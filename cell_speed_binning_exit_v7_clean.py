@@ -938,6 +938,33 @@ def main():
     ap.add_argument("--dedup_dist",   type=float, default=25)
     ap.add_argument("--dedup_keep",   type=int,   default=4000)
 
+    ap.add_argument("--count_at_line", action="store_true",
+                    help="Alternative to full entry-to-exit tracking: instead of following each "
+                         "cell's whole trajectory through the frame with Hungarian matching "
+                         "(fragile in dense footage -- confirmed directly that at high density "
+                         "a track's identity can hop between different nearby cells over its "
+                         "multi-second journey, producing an erratic, non-physical path that "
+                         "never registers as a real crossing), only watch the narrow band right "
+                         "at the exit boundary and count each distinct blob that appears there. "
+                         "A cell only needs correct short-range matching for the handful of "
+                         "frames it's actually in the band, not its entire crossing -- far less "
+                         "ambiguous, since the band has far fewer simultaneous cells than the "
+                         "whole frame. Speed is estimated from the blob's own movement while "
+                         "inside the band only (a much shorter, noisier baseline than a full "
+                         "trajectory), not the whole frame-to-frame journey.")
+    ap.add_argument("--line_band_px", type=float, default=40,
+                    help="How far from the exit boundary (in px) a detection counts as "
+                         "'in the band' for --count_at_line. Wider than --exit_margin_px by "
+                         "default so a cell is visible in the band for a few frames, not just "
+                         "one, giving enough points for a local speed estimate.")
+    ap.add_argument("--line_dedup_dist", type=float, default=25,
+                    help="--count_at_line: max px between two in-band sightings for them to be "
+                         "treated as the same crossing cell rather than two different cells.")
+    ap.add_argument("--line_dedup_window", type=float, default=1.0,
+                    help="--count_at_line: max seconds between two in-band sightings for them "
+                         "to be treated as the same crossing cell. Should comfortably cover how "
+                         "long a real cell spends inside --line_band_px, not a whole trajectory.")
+
     ap.add_argument("--exit_side",      type=str, default="right",
                     choices=["right","left","top","bottom"])
     ap.add_argument("--exit_margin_px", type=int, default=10)
@@ -1037,6 +1064,17 @@ def main():
     short_track_counts = defaultdict(int)
     dead_cell_counts   = defaultdict(int)
     per_rows = []
+
+    # --count_at_line: a second, independent tracks-like dict scoped only to
+    # detections inside the narrow band near the exit boundary (args.line_band_px).
+    # Reuses hungarian_match/finalize_track/crossed_exit/near_exit unchanged -- the
+    # only difference from full-frame tracking is *which* detections it ever sees
+    # (band-only, so far fewer simultaneous cells to disambiguate) and the distance/
+    # time-window it uses for matching and expiry (line_dedup_dist/line_dedup_window
+    # instead of max_dist/max_missed).
+    next_line_id  = 1
+    line_tracks   = {}
+    line_max_missed = max(1, round(args.line_dedup_window * fps / max(1, args.frame_stride)))
 
     vw = None
     if args.debug_video:
@@ -1249,65 +1287,121 @@ def main():
 
         contours, detections, det_boxes = detect_cells(th, frame, gray, args, raw_diff=raw_diff)
 
-        for tid in tracks:
-            tracks[tid]["updated"] = False
+        if not args.count_at_line:
+            for tid in tracks:
+                tracks[tid]["updated"] = False
 
-        pairs, unmatched = hungarian_match(tracks, detections, args.max_dist)
+            pairs, unmatched = hungarian_match(tracks, detections, args.max_dist)
 
-        for tid, j in pairs:
-            cx, cy, is_streak, is_dead = detections[j]
-            st = tracks[tid]
-            st["cx"], st["cy"] = cx, cy
-            st["last_seen_frame"] = cur_frame
-            st["seen_count"]  += 1
-            st["missed_count"] = 0
-            st["updated"]      = True
-            st["is_streak"]    = st["is_streak"] or is_streak
-            st["dead_count"]  += 1 if is_dead else 0
-            st["end_x"], st["end_y"] = cx, cy
+            for tid, j in pairs:
+                cx, cy, is_streak, is_dead = detections[j]
+                st = tracks[tid]
+                st["cx"], st["cy"] = cx, cy
+                st["last_seen_frame"] = cur_frame
+                st["seen_count"]  += 1
+                st["missed_count"] = 0
+                st["updated"]      = True
+                st["is_streak"]    = st["is_streak"] or is_streak
+                st["dead_count"]  += 1 if is_dead else 0
+                st["end_x"], st["end_y"] = cx, cy
 
-        for j in unmatched:
-            cx, cy, is_streak, is_dead = detections[j]
-            if args.enable_streak and is_streak:
-                while (recent_streaks
-                       and cur_frame - recent_streaks[0][0] > args.streak_merge_window):
-                    recent_streaks.popleft()
-                if any(math.hypot(cx-x0,cy-y0) <= args.streak_merge_dist
-                       for _,x0,y0 in recent_streaks):
-                    continue
-                recent_streaks.append((cur_frame, cx, cy))
-            tracks[next_id] = dict(
-                cx=cx, cy=cy, first_frame=cur_frame, last_seen_frame=cur_frame,
-                seen_count=1, missed_count=0, is_streak=bool(is_streak),
-                dead_count=1 if is_dead else 0,
-                updated=True, start_x=cx, start_y=cy, end_x=cx, end_y=cy)
-            next_id += 1
+            for j in unmatched:
+                cx, cy, is_streak, is_dead = detections[j]
+                if args.enable_streak and is_streak:
+                    while (recent_streaks
+                           and cur_frame - recent_streaks[0][0] > args.streak_merge_window):
+                        recent_streaks.popleft()
+                    if any(math.hypot(cx-x0,cy-y0) <= args.streak_merge_dist
+                           for _,x0,y0 in recent_streaks):
+                        continue
+                    recent_streaks.append((cur_frame, cx, cy))
+                tracks[next_id] = dict(
+                    cx=cx, cy=cy, first_frame=cur_frame, last_seen_frame=cur_frame,
+                    seen_count=1, missed_count=0, is_streak=bool(is_streak),
+                    dead_count=1 if is_dead else 0,
+                    updated=True, start_x=cx, start_y=cy, end_x=cx, end_y=cy)
+                next_id += 1
 
-        to_del = []
-        for tid, st in tracks.items():
-            if crossed_exit(st["cx"], st["cy"]):
-                t_abs = st["last_seen_frame"] / fps
-                finalize_track(t_abs, t_abs-start_s, st, tid, "passed_line")
-                to_del.append(tid)
-        for tid in to_del:
-            tracks.pop(tid, None)
+            to_del = []
+            for tid, st in tracks.items():
+                if crossed_exit(st["cx"], st["cy"]):
+                    t_abs = st["last_seen_frame"] / fps
+                    finalize_track(t_abs, t_abs-start_s, st, tid, "passed_line")
+                    to_del.append(tid)
+            for tid in to_del:
+                tracks.pop(tid, None)
 
-        for tid, st in list(tracks.items()):
-            if not st["updated"]:
-                st["missed_count"] += 1
-                if st["missed_count"] > args.max_missed:
-                    # Only count a lost track if it was actually near the exit boundary
-                    # when lost (genuinely mid-crossing, e.g. fragmented right at the
-                    # edge) -- same reasoning as end_of_range. A track lost anywhere
-                    # else in the frame (occlusion, a brief detection gap, MOG2 losing
-                    # it mid-frame) never demonstrated it was exiting and should just be
-                    # dropped, not counted as a cell that passed the FOV. Confirmed via
-                    # --verify_crossings_out: a "missing" cell counted near the bottom
-                    # of a "top"-exit frame, nowhere near the boundary.
-                    if near_exit(st["cx"], st["cy"], args.end_of_range_margin_px):
-                        t_abs = st["last_seen_frame"] / fps
-                        finalize_track(t_abs, t_abs-start_s, st, tid, "missing")
-                    tracks.pop(tid, None)
+            for tid, st in list(tracks.items()):
+                if not st["updated"]:
+                    st["missed_count"] += 1
+                    if st["missed_count"] > args.max_missed:
+                        # Only count a lost track if it was actually near the exit boundary
+                        # when lost (genuinely mid-crossing, e.g. fragmented right at the
+                        # edge) -- same reasoning as end_of_range. A track lost anywhere
+                        # else in the frame (occlusion, a brief detection gap, MOG2 losing
+                        # it mid-frame) never demonstrated it was exiting and should just be
+                        # dropped, not counted as a cell that passed the FOV. Confirmed via
+                        # --verify_crossings_out: a "missing" cell counted near the bottom
+                        # of a "top"-exit frame, nowhere near the boundary.
+                        if near_exit(st["cx"], st["cy"], args.end_of_range_margin_px):
+                            t_abs = st["last_seen_frame"] / fps
+                            finalize_track(t_abs, t_abs-start_s, st, tid, "missing")
+                        tracks.pop(tid, None)
+        else:
+            # --count_at_line: identical shape of update/expire logic to the full-frame
+            # tracker above, but only ever sees detections inside the exit-boundary band
+            # (line_band_px) and uses line_dedup_dist/line_max_missed instead of
+            # max_dist/max_missed for matching/expiry -- see line_tracks comment above.
+            band_detections = [d for d in detections if near_exit(d[0], d[1], args.line_band_px)]
+
+            for tid in line_tracks:
+                line_tracks[tid]["updated"] = False
+
+            pairs, unmatched = hungarian_match(line_tracks, band_detections, args.line_dedup_dist)
+
+            for tid, j in pairs:
+                cx, cy, is_streak, is_dead = band_detections[j]
+                st = line_tracks[tid]
+                st["cx"], st["cy"] = cx, cy
+                st["last_seen_frame"] = cur_frame
+                st["seen_count"]  += 1
+                st["missed_count"] = 0
+                st["updated"]      = True
+                st["is_streak"]    = st["is_streak"] or is_streak
+                st["dead_count"]  += 1 if is_dead else 0
+                st["end_x"], st["end_y"] = cx, cy
+
+            for j in unmatched:
+                cx, cy, is_streak, is_dead = band_detections[j]
+                line_tracks[next_line_id] = dict(
+                    cx=cx, cy=cy, first_frame=cur_frame, last_seen_frame=cur_frame,
+                    seen_count=1, missed_count=0, is_streak=bool(is_streak),
+                    dead_count=1 if is_dead else 0,
+                    updated=True, start_x=cx, start_y=cy, end_x=cx, end_y=cy)
+                next_line_id += 1
+
+            to_del = []
+            for tid, st in line_tracks.items():
+                if crossed_exit(st["cx"], st["cy"]):
+                    t_abs = st["last_seen_frame"] / fps
+                    finalize_track(t_abs, t_abs-start_s, st, tid, "passed_line")
+                    to_del.append(tid)
+            for tid in to_del:
+                line_tracks.pop(tid, None)
+
+            for tid, st in list(line_tracks.items()):
+                if not st["updated"]:
+                    st["missed_count"] += 1
+                    if st["missed_count"] > line_max_missed:
+                        # A band sighting that goes stale without ever reaching the
+                        # actual exit boundary is only counted if it was genuinely close
+                        # when it dropped out (e.g. lost right at the edge); otherwise
+                        # it never demonstrated it was really exiting (could be a cell
+                        # that entered the band and drifted back) and is dropped.
+                        if near_exit(st["cx"], st["cy"], args.end_of_range_margin_px):
+                            t_abs = st["last_seen_frame"] / fps
+                            finalize_track(t_abs, t_abs-start_s, st, tid, "missing")
+                        line_tracks.pop(tid, None)
 
         if vw is not None:
             left = frame.copy()
@@ -1329,7 +1423,8 @@ def main():
                     col = (0,0,255) if is_dead else ((0,255,255) if is_s else (255,0,255))
                     cv2.rectangle(left,(x,y),(x+w,y+h),col,1)
 
-            for tid,st in tracks.items():
+            active_tracks = line_tracks if args.count_at_line else tracks
+            for tid,st in active_tracks.items():
                 dead = st["dead_count"] * 2 >= st["seen_count"]
                 col = (0,0,255) if dead else ((0,255,0) if not st["is_streak"] else (0,255,255))
                 cv2.circle(left,(st["cx"],st["cy"]),3,col,-1)
@@ -1337,7 +1432,7 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX,0.4,(255,255,255),1)
 
             cv2.putText(left,
-                f"t={cur_frame/fps:.1f}s det={len(detections)} trk={len(tracks)}",
+                f"t={cur_frame/fps:.1f}s det={len(detections)} trk={len(active_tracks)}",
                 (10,20),cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
 
             if args.debug_show_mask:
@@ -1355,10 +1450,11 @@ def main():
     # window) is dropped, not counted: it never demonstrated it was exiting at all.
     if last_processed is not None and args.end_of_range_margin_px > 0:
         t_abs_end = last_processed / fps
-        for tid, st in list(tracks.items()):
+        active_tracks = line_tracks if args.count_at_line else tracks
+        for tid, st in list(active_tracks.items()):
             if near_exit(st["cx"], st["cy"], args.end_of_range_margin_px):
                 finalize_track(t_abs_end, t_abs_end - start_s, st, tid, "end_of_range")
-        tracks.clear()
+        active_tracks.clear()
 
     if last_processed is None:
         duration_rel_s = 0.0
