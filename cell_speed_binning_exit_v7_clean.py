@@ -1022,6 +1022,30 @@ def main():
         raise SystemExit(f"Cannot open: {args.video}")
     fps = args.fps or cap.get(cv2.CAP_PROP_FPS) or 30.0
 
+    # A cell lingering in the exit margin (e.g. a real, slow adhesion-interacting cell
+    # creeping along the boundary, not just flowing straight through) gets its track
+    # destroyed and recreated every processed frame -- each recreation immediately
+    # re-satisfies crossed_exit and would be finalized as a brand-new crossing if not
+    # for is_duplicate_exit's dedup_window. But dedup_window is a fixed wall-clock
+    # duration, while --frame_stride widens the real gap between processed frames
+    # (frame_stride/fps seconds apart, not 1/fps) -- if dedup_window is shorter than
+    # that gap, the previous exit's dedup entry has already "expired" by the time the
+    # next frame's re-detection of the SAME lingering cell arrives, so it looks like a
+    # brand-new cell every single frame. Confirmed directly: a real slow-rolling cell
+    # produced 29 separate passed_line counts spaced almost exactly frame_stride/fps
+    # apart, instead of 1. Auto-raise dedup_window to a safe floor above that gap
+    # rather than silently under-count -- or rather, silently over-count -- whenever
+    # --frame_stride makes the default (tuned for stride=1) too short.
+    frame_period = args.frame_stride / fps
+    dedup_floor  = 1.5 * frame_period
+    if args.dedup_window < dedup_floor:
+        print(f"NOTE: --dedup_window ({args.dedup_window:g}s) is shorter than 1.5x the gap "
+              f"between processed frames at --frame_stride {args.frame_stride:g} "
+              f"({frame_period:.3f}s/frame) -- a cell lingering in the exit margin across "
+              f"multiple frames could get re-counted as a new crossing every frame. "
+              f"Auto-raising --dedup_window to {dedup_floor:.3f}s.")
+        args.dedup_window = dedup_floor
+
     start_s     = max(0.0, args.start_s)
     start_frame = int(start_s * fps)
     end_frame_excl = int(args.end_s * fps) if args.end_s else None
