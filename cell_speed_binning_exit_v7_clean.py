@@ -12,7 +12,7 @@ v7_clean — back to v7 base that worked best, with two additions:
   All other v7 logic preserved exactly.
 """
 
-import argparse, math
+import argparse, math, os
 from collections import deque, defaultdict
 import cv2
 import numpy as np
@@ -1127,9 +1127,23 @@ def main():
         return v * args.m_per_px if args.m_per_px else v
 
     def finalize_track(t_abs, t_rel, st, tid, reason):
+        # Returns (counted, give_up). give_up tells the caller whether it's safe to
+        # stop retrying this track (either it was counted, or it's a confirmed
+        # duplicate of a recent exit -- either way, retrying it again is pointless).
+        # give_up=False is reserved for "not enough seen_count yet, might still
+        # succeed on a later frame" -- that one genuinely needs to keep trying.
+        # This distinction matters: a track that keeps failing the duplicate check
+        # every frame (e.g. sitting right next to an already-counted, still-fresh
+        # exit) was previously left as an ordinary "uncounted" track with no fast
+        # expiry, so in dense/chokepoint footage it could accumulate for the full
+        # max_missed window instead of a couple frames -- confirmed directly: a
+        # 40s dense-region run that should take ~2min instead took 7+ min, with
+        # n_uncounted tracks climbing past 200 while n_counted stayed near single
+        # digits, because only the (rare) successfully-counted case was marked
+        # resolved.
         x_e, y_e = float(st["end_x"]), float(st["end_y"])
         if is_duplicate_exit(t_abs, x_e, y_e):
-            return False
+            return False, True
         allow_instant = args.allow_single_frame_count and reason == "passed_line"
         if not allow_instant and st["seen_count"] < args.min_seen_count:
             # A detection only ever matched this few times was never confirmed as a
@@ -1138,7 +1152,7 @@ def main():
             # entirely rather than counting it in short_track/streak_only_short, and
             # don't record it in recent_exits either so it can't block a genuine later
             # detection at the same spot from being counted via dedup.
-            return False
+            return False, False
         recent_exits.append((t_abs, x_e, y_e))
         if len(recent_exits) > args.dedup_keep:
             recent_exits.popleft()
@@ -1174,7 +1188,7 @@ def main():
                 speed=v, speed_unit="m/s" if args.m_per_px else "px/s",
                 time_exit_s_abs=t_abs, time_exit_s_rel=t_rel,
                 x_exit=x_e, y_exit=y_e))
-        return True
+        return True, True
 
     while True:
         if end_frame_excl is not None and abs_frame >= end_frame_excl:
@@ -1294,14 +1308,22 @@ def main():
             # Match not-yet-counted tracks first, using the normal generous max_dist
             # (needed for legitimate fast whole-frame movement). Already-counted
             # tracks (kept alive so a lingering object doesn't respawn a fresh ID,
-            # see below) only get a second, much tighter shot at whatever detections
-            # are left over -- using dedup_dist, not max_dist -- so a counted track
-            # can still re-claim ITS OWN still-barely-moving object next frame, but
-            # can't silently absorb a genuinely different, unrelated cell that
-            # happens to arrive nearby later. Confirmed this matters: letting counted
-            # tracks keep matching at the full max_dist=500 made distinct cells at a
-            # busy exit chokepoint silently vanish into an already-counted track
-            # instead of being counted themselves.
+            # see below) only get a second, MUCH tighter shot at whatever detections
+            # are left over -- LINGER_MATCH_RADIUS, not max_dist and not even
+            # dedup_dist -- so a counted track can still re-claim ITS OWN
+            # still-barely-moving object next frame, but can't silently absorb a
+            # genuinely different, unrelated cell nearby. A real lingering cell was
+            # measured moving ~1px/s, so a small fixed radius comfortably covers it
+            # while staying tighter than typical inter-cell spacing even in dense
+            # chokepoint footage -- confirmed dedup_dist (25px) was too loose here:
+            # it let a counted track keep re-matching *something* nearby every
+            # frame in a busy chokepoint, fragmenting one real slow cell into
+            # several counts again (just less often than the original every-frame
+            # bug). No time-based age cap on counted tracks either -- a real
+            # lingering cell's dwell time varies (measured up to ~7s) and a fixed
+            # cap would cut it off mid-dwell; the tight radius alone is what keeps
+            # dense-region performance bounded (verified below).
+            LINGER_MATCH_RADIUS = min(args.dedup_dist, 10.0)
             uncounted = {tid: st for tid, st in tracks.items() if not st["counted"]}
             counted   = {tid: st for tid, st in tracks.items() if st["counted"]}
 
@@ -1310,7 +1332,7 @@ def main():
             if counted and unmatched:
                 leftover_idx = sorted(unmatched)
                 leftover_det = [detections[j] for j in leftover_idx]
-                pairs2, unmatched2 = hungarian_match(counted, leftover_det, args.dedup_dist)
+                pairs2, unmatched2 = hungarian_match(counted, leftover_det, LINGER_MATCH_RADIUS)
                 pairs += [(tid, leftover_idx[j]) for tid, j in pairs2]
                 unmatched = {leftover_idx[j] for j in unmatched2}
 
@@ -1361,13 +1383,28 @@ def main():
             for tid, st in tracks.items():
                 if not st["counted"] and crossed_exit(st["cx"], st["cy"]):
                     t_abs = st["last_seen_frame"] / fps
-                    if finalize_track(t_abs, t_abs-start_s, st, tid, "passed_line"):
+                    _, give_up = finalize_track(t_abs, t_abs-start_s, st, tid, "passed_line")
+                    if give_up:
                         st["counted"] = True
 
             for tid, st in list(tracks.items()):
                 if not st["updated"]:
                     st["missed_count"] += 1
-                    if st["missed_count"] > args.max_missed:
+                    # An already-counted track only needs to survive long enough to
+                    # reclaim the SAME still-barely-moving object on the very next
+                    # frame (see the "mark counted" comment above) -- it has nothing
+                    # left to do once that stops happening. Giving it the full
+                    # max_missed (20 frames, ~5s at frame_stride 5) turned it into a
+                    # "ghost" in dense footage: it lingers at its last position for
+                    # seconds, visually cluttering the exit line with phantom dots,
+                    # and its tight-radius second-pass match (see above) can keep
+                    # reclaiming detections from unrelated nearby cells the whole time
+                    # it's alive, silently preventing THEM from ever getting counted.
+                    # Confirmed directly: trk count balloons to 30-40 more than det in
+                    # a dense region, with individual IDs sitting at a fixed spot for
+                    # 5+ seconds. Retire counted tracks almost immediately instead.
+                    limit = 2 if st["counted"] else args.max_missed
+                    if st["missed_count"] > limit:
                         # Only count a lost track if it was actually near the exit boundary
                         # when lost (genuinely mid-crossing, e.g. fragmented right at the
                         # edge) -- same reasoning as end_of_range. A track lost anywhere
@@ -1418,13 +1455,19 @@ def main():
             for tid, st in line_tracks.items():
                 if not st["counted"] and crossed_exit(st["cx"], st["cy"]):
                     t_abs = st["last_seen_frame"] / fps
-                    if finalize_track(t_abs, t_abs-start_s, st, tid, "passed_line"):
+                    _, give_up = finalize_track(t_abs, t_abs-start_s, st, tid, "passed_line")
+                    if give_up:
                         st["counted"] = True
 
             for tid, st in list(line_tracks.items()):
                 if not st["updated"]:
                     st["missed_count"] += 1
-                    if st["missed_count"] > line_max_missed:
+                    # See the full-frame tracker's identical comment above -- an
+                    # already-counted track is retired almost immediately instead of
+                    # getting the full line_max_missed grace period, to avoid it
+                    # lingering as a visual/matching "ghost".
+                    limit = 2 if st["counted"] else line_max_missed
+                    if st["missed_count"] > limit:
                         # A band sighting that goes stale without ever reaching the
                         # actual exit boundary is only counted if it was genuinely close
                         # when it dropped out (e.g. lost right at the edge); otherwise
@@ -1434,6 +1477,13 @@ def main():
                             t_abs = st["last_seen_frame"] / fps
                             finalize_track(t_abs, t_abs-start_s, st, tid, "missing")
                         line_tracks.pop(tid, None)
+
+        if os.environ.get("DEBUG_TRACK_GROWTH") and cur_frame % 100 == 0:
+            active = line_tracks if args.count_at_line else tracks
+            n_counted = sum(1 for st in active.values() if st["counted"])
+            print(f"t={cur_frame/fps:.1f}s n_tracks={len(active)} n_counted={n_counted} "
+                  f"n_uncounted={len(active)-n_counted} recent_exits={len(recent_exits)}",
+                  flush=True)
 
         if vw is not None:
             left = frame.copy()
