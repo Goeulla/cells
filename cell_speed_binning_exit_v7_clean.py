@@ -1473,7 +1473,21 @@ def main():
                         # when it dropped out (e.g. lost right at the edge); otherwise
                         # it never demonstrated it was really exiting (could be a cell
                         # that entered the band and drifted back) and is dropped.
-                        if not st["counted"] and near_exit(st["cx"], st["cy"], args.end_of_range_margin_px):
+                        # Using exit_margin_px here, NOT end_of_range_margin_px: every
+                        # line_track already lives within line_band_px (40px default) of
+                        # the boundary by construction (that's the whole band), so the
+                        # much looser end_of_range_margin_px (60px default -- sized for
+                        # the full-frame tracker, where a track can be anywhere in the
+                        # whole frame) is >= line_band_px and therefore ALWAYS true here,
+                        # making this check a no-op -- every lost line_track got counted
+                        # regardless of how close it actually got to the real line.
+                        # Confirmed directly: a sparser, noisier region (more tracks lost
+                        # mid-band before precisely reaching the line) produced MORE
+                        # counted cells than a visibly denser region (det=340 vs 153),
+                        # because more of its tracks fell back through this always-true
+                        # check. exit_margin_px is the same precision standard a genuine
+                        # passed_line crossing already has to meet.
+                        if not st["counted"] and near_exit(st["cx"], st["cy"], args.exit_margin_px):
                             t_abs = st["last_seen_frame"] / fps
                             finalize_track(t_abs, t_abs-start_s, st, tid, "missing")
                         line_tracks.pop(tid, None)
@@ -1533,8 +1547,13 @@ def main():
     if last_processed is not None and args.end_of_range_margin_px > 0:
         t_abs_end = last_processed / fps
         active_tracks = line_tracks if args.count_at_line else tracks
+        # Same reasoning as the line_tracks missing-timeout check above: for
+        # --count_at_line, end_of_range_margin_px is always looser than line_band_px
+        # and so is a no-op filter -- use exit_margin_px instead so this only counts
+        # a track that was genuinely close to the real line when the clip ended.
+        margin = args.exit_margin_px if args.count_at_line else args.end_of_range_margin_px
         for tid, st in list(active_tracks.items()):
-            if not st["counted"] and near_exit(st["cx"], st["cy"], args.end_of_range_margin_px):
+            if not st["counted"] and near_exit(st["cx"], st["cy"], margin):
                 finalize_track(t_abs_end, t_abs_end - start_s, st, tid, "end_of_range")
         active_tracks.clear()
 
