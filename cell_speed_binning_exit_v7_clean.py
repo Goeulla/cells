@@ -957,9 +957,21 @@ def main():
                          "'in the band' for --count_at_line. Wider than --exit_margin_px by "
                          "default so a cell is visible in the band for a few frames, not just "
                          "one, giving enough points for a local speed estimate.")
-    ap.add_argument("--line_dedup_dist", type=float, default=25,
+    ap.add_argument("--line_dedup_dist", type=float, default=10,
                     help="--count_at_line: max px between two in-band sightings for them to be "
-                         "treated as the same crossing cell rather than two different cells.")
+                         "treated as the same crossing cell rather than two different cells. "
+                         "This is the ONLY matching radius for line_tracks (unlike the full-frame "
+                         "tracker, which uses a separate, much tighter radius just for reclaiming "
+                         "an already-counted lingering cell) -- it has to be tight enough that two "
+                         "genuinely different, simultaneously-present cells in the band don't get "
+                         "matched to the same track (silently dropping one of them), which becomes "
+                         "a real risk in dense footage: confirmed directly that at ~22px average "
+                         "in-band spacing, the old default of 25 (inherited from the full-frame "
+                         "tracker's --dedup_dist, never separately tuned for the narrower band) "
+                         "undercounted a dense region by more than half relative to a sparser one "
+                         "with the same measured band density ratio -- lowering it to 10 recovered "
+                         "most of that gap without fragmenting a real, independently-verified slow "
+                         "(~3px/s) lingering cell.")
     ap.add_argument("--line_dedup_window", type=float, default=1.0,
                     help="--count_at_line: max seconds between two in-band sightings for them "
                          "to be treated as the same crossing cell. Should comfortably cover how "
@@ -1423,6 +1435,9 @@ def main():
             # (line_band_px) and uses line_dedup_dist/line_max_missed instead of
             # max_dist/max_missed for matching/expiry -- see line_tracks comment above.
             band_detections = [d for d in detections if near_exit(d[0], d[1], args.line_band_px)]
+            if os.environ.get("DEBUG_BAND_DENSITY"):
+                print(f"t={cur_frame/fps:.3f}s det_whole_frame={len(detections)} "
+                      f"det_in_band={len(band_detections)}", flush=True)
 
             for tid in line_tracks:
                 line_tracks[tid]["updated"] = False
