@@ -1442,7 +1442,28 @@ def main():
             for tid in line_tracks:
                 line_tracks[tid]["updated"] = False
 
-            pairs, unmatched = hungarian_match(line_tracks, band_detections, args.line_dedup_dist)
+            # Same two-pass split as the full-frame tracker, and for the same reason:
+            # one shared distance can't do both jobs at once. Not-yet-counted tracks
+            # need a GENEROUS radius to bridge real frame-to-frame movement -- measured
+            # speeds up to ~400px/s here, which at a ~0.245s processed-frame gap is up
+            # to ~98px of real displacement, far more than line_dedup_dist (10px
+            # default). Already-counted tracks only need the tight line_dedup_dist to
+            # reclaim their own still-barely-moving object, not to find a genuinely new
+            # detection. Using line_dedup_dist for BOTH (as before) forced a choice
+            # between the two: tight enough to stop dense-region merging also broke
+            # fast-cell continuity in sparser regions, fragmenting and undercounting
+            # real fast crossings there instead.
+            uncounted_lt = {tid: st for tid, st in line_tracks.items() if not st["counted"]}
+            counted_lt   = {tid: st for tid, st in line_tracks.items() if st["counted"]}
+
+            pairs, unmatched = hungarian_match(uncounted_lt, band_detections, args.max_dist)
+
+            if counted_lt and unmatched:
+                leftover_idx = sorted(unmatched)
+                leftover_det = [band_detections[j] for j in leftover_idx]
+                pairs2, unmatched2 = hungarian_match(counted_lt, leftover_det, args.line_dedup_dist)
+                pairs += [(tid, leftover_idx[j]) for tid, j in pairs2]
+                unmatched = {leftover_idx[j] for j in unmatched2}
 
             for tid, j in pairs:
                 cx, cy, is_streak, is_dead = band_detections[j]
