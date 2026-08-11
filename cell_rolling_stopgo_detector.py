@@ -33,7 +33,8 @@ import pandas as pd
 from cell_speed_binning_exit_v7_clean import detect_cells, hungarian_match
 
 
-def analyze_trajectory(history, fps, frame_stride, stop_px, min_stop_frames, m_per_px):
+def analyze_trajectory(history, fps, frame_stride, stop_px, min_stop_frames, m_per_px,
+                        min_track_span_px=15.0):
     """
     history: list of (frame_idx, cx, cy), one entry per frame the track was
     seen, in order. Returns a dict of stop/go stats + a classification.
@@ -43,6 +44,22 @@ def analyze_trajectory(history, fps, frame_stride, stop_px, min_stop_frames, m_p
         return dict(n_steps=0, n_stop_episodes=0, stopped_frames=0, moving_frames=0,
                     stopped_s=0.0, moving_s=0.0, mean_moving_speed=0.0,
                     classification="too_short")
+
+    # A track confined to a tiny area over its WHOLE lifetime -- even if per-step
+    # jitter occasionally crosses stop_px -- is far more likely static debris/a
+    # background artifact than a real cell: even a genuine stop-and-go cell should
+    # cover noticeably more ground between its stop and move phases than pure mask/
+    # watershed centroid noise on something that never actually moves. Checking
+    # this on the bounding-box span of the WHOLE trajectory (not per-step) catches
+    # exactly the case per-step noise can slip through: many small jitters that
+    # each individually clear stop_px, without the track ever really going anywhere.
+    xs = [p[1] for p in history]
+    ys = [p[2] for p in history]
+    span = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+    if span < min_track_span_px:
+        return dict(n_steps=n-1, n_stop_episodes=0, stopped_frames=n-1, moving_frames=0,
+                    stopped_s=(n-1)*frame_stride/fps, moving_s=0.0, mean_moving_speed=0.0,
+                    classification="static_artifact")
 
     step_period_s = frame_stride / fps  # real seconds between consecutive history entries
     states = []  # True = stopped, False = moving, one per step
@@ -156,6 +173,12 @@ def main():
     ap.add_argument("--min_stop_frames", type=int, default=3,
                     help="Minimum consecutive 'stopped' steps to count as a real stop episode, "
                          "not single-frame jitter.")
+    ap.add_argument("--min_track_span_px", type=float, default=15.0,
+                    help="A track whose ENTIRE trajectory (not just one step) stays within "
+                         "this many px of its own bounding box is classified 'static_artifact' "
+                         "instead of rolling/stationary -- catches background debris whose "
+                         "per-step mask/watershed centroid noise occasionally crosses --stop_px "
+                         "without the track ever really going anywhere.")
     ap.add_argument("--m_per_px", type=float, default=None)
 
     ap.add_argument("--out_csv", type=str, default="rolling_stopgo.csv")
@@ -212,7 +235,8 @@ def main():
 
     def finalize(tid, st):
         stats = analyze_trajectory(st["history"], fps, args.frame_stride,
-                                    args.stop_px, args.min_stop_frames, args.m_per_px)
+                                    args.stop_px, args.min_stop_frames, args.m_per_px,
+                                    args.min_track_span_px)
         if len(st["history"]) < args.min_seen_count:
             return
         first_frame, sx, sy = st["history"][0]
