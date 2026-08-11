@@ -97,7 +97,20 @@ def main():
     ap.add_argument("--video", required=True)
     ap.add_argument("--start_s", type=float, default=0.0)
     ap.add_argument("--end_s", type=float, default=None)
-    ap.add_argument("--warmup_s", type=float, default=45.0)
+    ap.add_argument("--warmup_s", type=float, default=45.0,
+                    help="Seconds of real prior footage to feed MOG2 before --start_s, so the "
+                         "background model is settled before analysis begins. Do NOT set this "
+                         "to 0 to save time when testing -- confirmed directly: with no warmup, "
+                         "an untrained MOG2 model flags noisy/unstable blobs indiscriminately "
+                         "for the first several seconds, and a track that starts during that "
+                         "window can show spurious jittery 'stopped' steps that look like real "
+                         "stop-and-go behavior but are actually just detector noise. On a real "
+                         "non-functionalized (negative control) clip, skipping warmup produced "
+                         "78%% false 'rolling' classifications; with proper warmup on the same "
+                         "video, that dropped to 0%% (all correctly free_flowing). This needs "
+                         "real footage before --start_s to work -- if testing an isolated short "
+                         "clip, set --start_s well after the clip's own beginning so there's "
+                         "actual prior video for warmup to use, not just silence/nothing.")
     ap.add_argument("--fps", type=float, default=None)
     ap.add_argument("--frame_stride", type=int, default=1,
                     help="Frame-by-frame trajectory analysis is sensitive to sampling gaps "
