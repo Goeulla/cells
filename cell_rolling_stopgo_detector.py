@@ -250,10 +250,15 @@ def main():
                          "script's uncounted-track pass. No tight/counted second pass here -- "
                          "this tool has no 'already resolved' concept, it watches full "
                          "lifetimes.")
-    ap.add_argument("--max_missed", type=int, default=10,
-                    help="Frames a track can go unmatched before being finalized. Higher than "
-                         "the counting script's default since a genuinely stopped cell may not "
-                         "be re-detected as cleanly frame to frame even while it's still there.")
+    ap.add_argument("--max_missed", type=int, default=5,
+                    help="Frames a track can go unmatched before being finalized. Kept modest "
+                         "(not 0) since a genuinely stopped cell may not be re-detected as "
+                         "cleanly frame to frame even while it's still there -- but a long gap "
+                         "combined with a stale, frozen position prediction is exactly the "
+                         "condition that let unrelated tracks get merged via reacquisition (see "
+                         "the per-track reacquisition-distance cap in the matching loop, which "
+                         "is the main defense against that; this bound is a second, coarser "
+                         "backstop so a track can't sit in limbo indefinitely).")
     ap.add_argument("--min_seen_count", type=int, default=5,
                     help="Minimum trajectory length (frames) for a track to be analyzed at "
                          "all -- short tracks don't have enough steps for a stop/go pattern to "
@@ -414,6 +419,42 @@ def main():
             tracks_for_matching[tid] = dict(st, cx=pred_cx, cy=pred_cy)
 
         pairs, unmatched = hungarian_match(tracks_for_matching, detections, args.max_dist)
+
+        # Post-filter: max_dist=500 is a deliberately generous whole-frame radius
+        # meant for fast passing cells, but it's dangerously generous for a track
+        # that has been missed for a few frames -- during a gap, hungarian_match
+        # will happily reacquire ANY detection within 500px of the frozen
+        # prediction, even one that belongs to a completely different, unrelated
+        # cell that just wandered into range. This created "teleporting" trails
+        # confirmed visually (t=21.1s screenshot: trails spanning most of the
+        # frame that don't correspond to any real moving cell). Fix: cap the
+        # allowed reacquisition jump to what THIS track's own trajectory has
+        # actually shown it capable of, scaled by how long it's been missing (a
+        # genuinely fast track can legitimately cover more ground over a longer
+        # gap; a track that's been sitting still has no business grabbing a
+        # detection far away just because the global radius allows it).
+        confirmed_pairs = []
+        rejected_det_idxs = []
+        for tid, j in pairs:
+            st = tracks[tid]
+            hist = st["history"]
+            if len(hist) >= 2:
+                steps = [math.hypot(hist[k][1]-hist[k-1][1], hist[k][2]-hist[k-1][2])
+                        for k in range(1, len(hist))]
+                own_max_step = max(steps)
+            else:
+                own_max_step = args.max_dist  # no track record yet -- don't restrict first real match
+            gap = st["missed_count"] + 1
+            reacquire_cap = max(args.stop_px * 4.0, own_max_step * 1.5) * gap
+            pred_cx, pred_cy = tracks_for_matching[tid]["cx"], tracks_for_matching[tid]["cy"]
+            det_cx, det_cy, _is_streak, _is_dead = detections[j]
+            jump = math.hypot(det_cx - pred_cx, det_cy - pred_cy)
+            if jump <= reacquire_cap:
+                confirmed_pairs.append((tid, j))
+            else:
+                rejected_det_idxs.append(j)
+        pairs = confirmed_pairs
+        unmatched = list(unmatched) + rejected_det_idxs
 
         for tid, j in pairs:
             cx, cy, _is_streak, _is_dead = detections[j]
