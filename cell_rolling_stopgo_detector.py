@@ -34,7 +34,7 @@ from cell_speed_binning_exit_v7_clean import detect_cells, hungarian_match
 
 
 def analyze_trajectory(history, fps, frame_stride, stop_px, min_stop_frames, m_per_px,
-                        min_track_span_px=15.0):
+                        min_track_span_px=15.0, min_move_frames=3):
     """
     history: list of (frame_idx, cx, cy), one entry per frame the track was
     seen, in order. Returns a dict of stop/go stats + a classification.
@@ -71,32 +71,61 @@ def analyze_trajectory(history, fps, frame_stride, stop_px, min_stop_frames, m_p
         states.append(d <= stop_px)
         step_speeds.append(d / step_period_s)
 
-    # Group into runs of consecutive identical state.
-    runs = []  # (is_stopped, length)
-    cur_state, cur_len = states[0], 1
-    for s in states[1:]:
+    # Group into runs of consecutive identical state. start_i/end_i are
+    # indices into `history` spanning the run (history[start_i] is the
+    # position just BEFORE the run's first step, history[end_i] is the
+    # position after the run's last step) so net displacement per run can be
+    # checked, not just step count.
+    runs = []  # (is_stopped, length, start_i, end_i)
+    cur_state, cur_len, cur_start = states[0], 1, 0
+    for i, s in enumerate(states[1:], start=1):
         if s == cur_state:
             cur_len += 1
         else:
-            runs.append((cur_state, cur_len))
-            cur_state, cur_len = s, 1
-    runs.append((cur_state, cur_len))
+            runs.append((cur_state, cur_len, cur_start, i))
+            cur_state, cur_len, cur_start = s, 1, i
+    runs.append((cur_state, cur_len, cur_start, len(states)))
 
     # Only count a "stopped" run as a real stop episode if it lasts at least
     # min_stop_frames steps -- a single-frame dip below stop_px is more likely
     # detection jitter than a genuine adhesion pause.
-    n_stop_episodes = sum(1 for is_stopped, length in runs
+    n_stop_episodes = sum(1 for is_stopped, length, _, _ in runs
                           if is_stopped and length >= min_stop_frames)
-    stopped_frames = sum(length for is_stopped, length in runs if is_stopped)
-    moving_frames  = sum(length for is_stopped, length in runs if not is_stopped)
+    stopped_frames = sum(length for is_stopped, length, _, _ in runs if is_stopped)
+    moving_frames  = sum(length for is_stopped, length, _, _ in runs if not is_stopped)
     moving_speeds  = [sp for sp, s in zip(step_speeds, states) if not s]
     mean_moving_speed = float(np.mean(moving_speeds)) if moving_speeds else 0.0
     if m_per_px:
         mean_moving_speed *= m_per_px
 
+    # Symmetric to the stop-episode floor above: require at least one MOVING
+    # run of min_move_frames consecutive steps AND real net displacement
+    # across that run, before calling a track "rolling". User-identified
+    # failure mode, confirmed by tracing individual tracks frame-by-frame:
+    # (1) a track that sits frozen (background debris) for its entire life
+    # except a single isolated large jump right before it ends (a
+    # mismatch/reacquisition glitch, not real motion) was passing the old
+    # "moving_frames > 0" bar on that one spurious step alone -- fixed by the
+    # length requirement below; (2) even with a length requirement, a track
+    # can rack up several small back-and-forth jitter steps that each
+    # individually clear stop_px without the track actually going anywhere
+    # (confirmed case: 3 consecutive ~5-14px steps wandering within a ~14x14px
+    # patch, net displacement ~0) -- fixed by also requiring the run's NET
+    # (start-to-end) displacement to clear min_track_span_px, not just the
+    # per-step magnitudes.
+    n_move_episodes = 0
+    for is_stopped, length, si, ei in runs:
+        if is_stopped or length < min_move_frames:
+            continue
+        _, x0, y0 = history[si]
+        _, x1, y1 = history[ei]
+        net_disp = math.hypot(x1 - x0, y1 - y0)
+        if net_disp >= min_track_span_px:
+            n_move_episodes += 1
+
     if n_stop_episodes == 0:
         classification = "free_flowing"
-    elif moving_frames == 0:
+    elif n_move_episodes == 0:
         classification = "stationary"
     else:
         classification = "rolling"
@@ -272,6 +301,13 @@ def main():
     ap.add_argument("--min_stop_frames", type=int, default=3,
                     help="Minimum consecutive 'stopped' steps to count as a real stop episode, "
                          "not single-frame jitter.")
+    ap.add_argument("--min_move_frames", type=int, default=3,
+                    help="Minimum consecutive 'moving' steps to count as a real release/move "
+                         "episode -- symmetric to --min_stop_frames. Without this, a track that "
+                         "sits frozen (background debris) its whole life except one isolated "
+                         "large jump (a tracking glitch, not real motion) was passing as "
+                         "'rolling' on that single spurious step alone. Confirmed by tracing "
+                         "individual frozen background tracks frame-by-frame on F_1_9_10.mp4.")
     ap.add_argument("--min_track_span_px", type=float, default=15.0,
                     help="A track whose ENTIRE trajectory (not just one step) stays within "
                          "this many px of its own bounding box is classified 'static_artifact' "
@@ -343,7 +379,7 @@ def main():
     def finalize(tid, st):
         stats = analyze_trajectory(st["history"], fps, args.frame_stride,
                                     args.stop_px, args.min_stop_frames, args.m_per_px,
-                                    args.min_track_span_px)
+                                    args.min_track_span_px, args.min_move_frames)
         if len(st["history"]) < args.min_seen_count:
             return
         first_frame, sx, sy = st["history"][0]
@@ -429,10 +465,21 @@ def main():
         # confirmed visually (t=21.1s screenshot: trails spanning most of the
         # frame that don't correspond to any real moving cell). Fix: cap the
         # allowed reacquisition jump to what THIS track's own trajectory has
-        # actually shown it capable of, scaled by how long it's been missing (a
-        # genuinely fast track can legitimately cover more ground over a longer
-        # gap; a track that's been sitting still has no business grabbing a
-        # detection far away just because the global radius allows it).
+        # actually shown it capable of.
+        #
+        # Deliberately NOT scaled up by how long the track has been missing.
+        # That was tried and made things worse: confirmed by tracing a specific
+        # flagged track (id 7 in an F_1_9_10.mp4 run) frame-by-frame -- once a
+        # long-gap reacquisition was (barely) accepted, it raised this track's
+        # own observed max step, which raised the cap for the NEXT reacquisition,
+        # letting a chain of hijacks onto different, unrelated cells snowball
+        # over several missed-frame gaps. A longer gap should make us LESS sure
+        # the next detection is the same object, not more permissive -- the
+        # track's own last known speed is only trustworthy over a short gap. A
+        # real fast track that gets fragmented after a long gap just splits
+        # into two IDs (safe: undercounts by one rolling episode); trusting a
+        # stale prediction over a long gap corrupts the classification directly
+        # (unsafe: fabricates a rolling episode out of unrelated cells).
         confirmed_pairs = []
         rejected_det_idxs = []
         for tid, j in pairs:
@@ -444,8 +491,7 @@ def main():
                 own_max_step = max(steps)
             else:
                 own_max_step = args.max_dist  # no track record yet -- don't restrict first real match
-            gap = st["missed_count"] + 1
-            reacquire_cap = max(args.stop_px * 4.0, own_max_step * 1.5) * gap
+            reacquire_cap = max(args.stop_px * 4.0, own_max_step * 1.5)
             pred_cx, pred_cy = tracks_for_matching[tid]["cx"], tracks_for_matching[tid]["cy"]
             det_cx, det_cy, _is_streak, _is_dead = detections[j]
             jump = math.hypot(det_cx - pred_cx, det_cy - pred_cy)
