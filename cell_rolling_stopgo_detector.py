@@ -137,6 +137,30 @@ def analyze_trajectory(history, fps, frame_stride, stop_px, min_stop_frames, m_p
         mean_moving_speed=mean_moving_speed, classification=classification)
 
 
+def near_exit(cx, cy, W, H, exit_side, margin):
+    """Same geometry/meaning as cell_speed_binning_exit_v7_clean.py's near_exit,
+    reimplemented here rather than imported since that one is a closure over
+    the counting script's own W/H/args."""
+    if exit_side == "right":  return cx >= W - 1 - margin
+    if exit_side == "left":   return cx <= margin
+    if exit_side == "bottom": return cy >= H - 1 - margin
+    return cy <= margin  # "top"
+
+
+def first_exit_crossing(history, W, H, exit_side, margin, fps):
+    """Returns (exit_frame, exit_time_s) for the first history point where the
+    track is within margin px of the exit edge, or (None, None) if it never
+    reaches the exit -- e.g. a track confined near the entrance, or a
+    fragment that ends mid-channel. Only counting tracks that actually reach
+    the exit keeps the rolling-cell rate comparable to the counting script's
+    real per-time-bin throughput, instead of diluting it with tracks that
+    were never going to be counted there either way."""
+    for f, cx, cy in history:
+        if near_exit(cx, cy, W, H, exit_side, margin):
+            return f, f / fps
+    return None, None
+
+
 def render_rolling_highlight(video_path, rolling_histories, fps, frame_stride,
                               warmup_start, out_path, stop_px, trail_len=30):
     """
@@ -316,6 +340,38 @@ def main():
                          "without the track ever really going anywhere.")
     ap.add_argument("--m_per_px", type=float, default=None)
 
+    # Exit-line counting -- mirrors cell_speed_binning_exit_v7_clean.py's
+    # --count_at_line geometry (--exit_side/--exit_margin_px, same meaning and
+    # defaults) so a "rolling cells per minute passing the line" rate is
+    # directly comparable to that script's "total cells per minute" throughput,
+    # instead of mixing in tracks that never actually made it to the exit
+    # (e.g. a track that only exists near the entrance, or a fragment from
+    # tracking noise). Unlike that script's real-time line_tracks dedup system
+    # (needed because it decides "counted" while still streaming), this tool
+    # already holds each track's full finalized trajectory, so counting is a
+    # single pass over each finished track: did it ever reach the exit band,
+    # and if so, was it classified rolling.
+    ap.add_argument("--exit_side", type=str, default="right",
+                    choices=["right","left","top","bottom"],
+                    help="Which frame edge is the channel exit -- same meaning as the "
+                         "counting script's --exit_side. Set this to match your channel's "
+                         "actual flow direction (e.g. 'bottom' for top-to-bottom flow); the "
+                         "default 'right' is almost certainly wrong for your footage.")
+    ap.add_argument("--exit_margin_px", type=int, default=10,
+                    help="Distance from the exit edge to count as 'reached the exit' -- same "
+                         "default as the counting script's --exit_margin_px.")
+    ap.add_argument("--bin_seconds", type=float, default=20.0,
+                    help="Time bin width for --line_csv, binned by the time each track "
+                         "reached the exit line (not its start time), so the rate is a real "
+                         "throughput measure comparable bin-for-bin against the counting "
+                         "script's --bin_seconds output.")
+    ap.add_argument("--line_csv", type=str, default=None,
+                    help="If set, writes a per-time-bin CSV of total vs. rolling cells that "
+                         "reached the exit line -- the rolling-cell throughput rate, not just "
+                         "a fraction of all detected tracks (many of which never reach the "
+                         "exit at all and so aren't really comparable to the counting script's "
+                         "per-time-bin numbers).")
+
     ap.add_argument("--out_csv", type=str, default="rolling_stopgo.csv")
     ap.add_argument("--debug_video", type=str, default=None)
     ap.add_argument("--draw_detections", action="store_true")
@@ -384,10 +440,14 @@ def main():
             return
         first_frame, sx, sy = st["history"][0]
         last_frame, ex, ey = st["history"][-1]
+        exit_frame, exit_time_s = first_exit_crossing(
+            st["history"], W, H, args.exit_side, args.exit_margin_px, fps)
         finished_rows.append(dict(
             track_id=tid, first_frame=first_frame, last_frame=last_frame,
             seen_count=len(st["history"]), duration_s=(last_frame-first_frame)/fps,
-            start_x=sx, start_y=sy, end_x=ex, end_y=ey, **stats))
+            start_x=sx, start_y=sy, end_x=ex, end_y=ey,
+            reached_exit=exit_frame is not None,
+            exit_frame=exit_frame, exit_time_s=exit_time_s, **stats))
         if stats["classification"] == "rolling":
             rolling_histories[tid] = list(st["history"])
 
@@ -526,6 +586,12 @@ def main():
         if vw is not None:
             orig = frame.copy()
             annotated = frame.copy()
+            m = args.exit_margin_px
+            lc = (0, 200, 255)
+            if   args.exit_side == "right":  cv2.line(annotated,(W-1-m,0),(W-1-m,H-1),lc,1)
+            elif args.exit_side == "left":   cv2.line(annotated,(m,0),(m,H-1),lc,1)
+            elif args.exit_side == "bottom": cv2.line(annotated,(0,H-1-m),(W-1,H-1-m),lc,1)
+            else:                            cv2.line(annotated,(0,m),(W-1,m),lc,1)
             if args.draw_detections:
                 for (x,y,w,h,is_s,is_dead) in det_boxes:
                     cv2.rectangle(annotated,(x,y),(x+w,y+h),(255,0,255),1)
@@ -556,6 +622,38 @@ def main():
     print(f"Wrote: {args.out_csv}  ({len(df)} tracks analyzed)")
     if len(df):
         print(df["classification"].value_counts().to_string())
+
+    if len(df):
+        exited = df[df["reached_exit"]]
+        n_total_exit = len(exited)
+        n_rolling_exit = int((exited["classification"] == "rolling").sum())
+        pct = 100.0 * n_rolling_exit / n_total_exit if n_total_exit else 0.0
+        print(f"Reached exit line ({args.exit_side}, margin={args.exit_margin_px}px): "
+              f"{n_total_exit} total, {n_rolling_exit} rolling ({pct:.1f}%)")
+
+        if args.line_csv:
+            # Bin by exit_time_s (when each track actually reached the exit),
+            # not by first_frame/start time -- this is what makes the rate
+            # directly comparable to the counting script's own --count_at_line
+            # per-bin throughput, which also counts at the moment of crossing.
+            bin_rows = []
+            if n_total_exit:
+                max_t = exited["exit_time_s"].max()
+                n_bins = int(max_t // args.bin_seconds) + 1
+                for b in range(n_bins):
+                    lo, hi = b * args.bin_seconds, (b + 1) * args.bin_seconds
+                    in_bin = exited[(exited["exit_time_s"] >= lo) & (exited["exit_time_s"] < hi)]
+                    tot = len(in_bin)
+                    roll = int((in_bin["classification"] == "rolling").sum())
+                    bin_rows.append(dict(
+                        time_start_s=lo, time_end_s=hi,
+                        total_crossed=tot, rolling_crossed=roll,
+                        rolling_pct=100.0 * roll / tot if tot else 0.0))
+            bin_df = pd.DataFrame(bin_rows, columns=["time_start_s","time_end_s",
+                                                      "total_crossed","rolling_crossed",
+                                                      "rolling_pct"])
+            bin_df.to_csv(args.line_csv, index=False)
+            print(f"Wrote: {args.line_csv}  ({len(bin_df)} bins)")
 
     if args.debug_video_rolling_only:
         render_rolling_highlight(args.video, rolling_histories, fps, args.frame_stride,
