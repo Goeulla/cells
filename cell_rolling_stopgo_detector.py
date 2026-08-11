@@ -108,6 +108,100 @@ def analyze_trajectory(history, fps, frame_stride, stop_px, min_stop_frames, m_p
         mean_moving_speed=mean_moving_speed, classification=classification)
 
 
+def render_rolling_highlight(video_path, rolling_histories, fps, frame_stride,
+                              warmup_start, out_path, stop_px, trail_len=30):
+    """
+    Second pass, only run after all tracks are finalized and we know which ones
+    ended up classified "rolling". Re-reads the video and draws ONLY those
+    tracks, each with a fading trail of its last --trail_len positions, instead
+    of every currently-active track (which was the actual usability problem --
+    with 50-100+ IDs on screen at once and changing every frame, following one
+    specific track by eye was nearly impossible even when the tracking was
+    correct). Colors: green=moving this step, red=stopped this step, same as
+    the main debug video, so the two are visually consistent.
+    """
+    if not rolling_histories:
+        print("No rolling tracks to highlight -- skipping highlight video.")
+        return
+
+    # frame_idx -> list of (tid, cx, cy, is_stopped) to draw this frame, precomputed
+    # from each track's own history so the render loop is just a lookup.
+    per_frame = defaultdict(list)
+    for tid, hist in rolling_histories.items():
+        for i, (f, cx, cy) in enumerate(hist):
+            is_stopped = False
+            if i > 0:
+                _, x0, y0 = hist[i-1]
+                is_stopped = math.hypot(cx-x0, cy-y0) <= stop_px
+            per_frame[f].append((tid, cx, cy, is_stopped))
+
+    cap = cv2.VideoCapture(video_path)
+    ret, frame0 = cap.read()
+    if not ret:
+        return
+    H, W = frame0.shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    vw = cv2.VideoWriter(out_path, fourcc, fps, (2*W, H))
+
+    trails = defaultdict(list)  # tid -> list of recent (cx,cy,is_stopped)
+    last_frame_of = {tid: hist[-1][0] for tid, hist in rolling_histories.items()}
+    min_f = min(per_frame) if per_frame else 0
+    max_f = max(per_frame) if per_frame else 0
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, warmup_start)
+    abs_frame = warmup_start
+    while True:
+        if abs_frame > max_f:
+            break
+        if frame_stride > 1 and (abs_frame - warmup_start) % frame_stride != 0:
+            if not cap.grab():
+                break
+            abs_frame += 1
+            continue
+        ret, frame = cap.read()
+        if not ret:
+            break
+        cur = abs_frame
+        abs_frame += 1
+        if cur < min_f:
+            continue
+
+        for tid, cx, cy, is_stopped in per_frame.get(cur, []):
+            trails[tid].append((cx, cy, is_stopped))
+            if len(trails[tid]) > trail_len:
+                trails[tid].pop(0)
+
+        orig = frame.copy()
+        annotated = frame.copy()
+        for tid, pts in trails.items():
+            if not pts:
+                continue
+            for i in range(1, len(pts)):
+                x0,y0,_ = pts[i-1]; x1,y1,s1 = pts[i]
+                col = (0,0,255) if s1 else (0,255,0)
+                cv2.line(annotated, (x0,y0), (x1,y1), col, 1)
+            lx, ly, ls = pts[-1]
+            col = (0,0,255) if ls else (0,255,0)
+            cv2.circle(annotated, (lx,ly), 4, col, -1)
+            cv2.putText(annotated, str(tid), (lx+5, ly-5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+        cv2.putText(annotated, f"t={cur/fps:.1f}s rolling_tracks_visible={len(trails)}",
+                    (10,20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        cv2.putText(orig, "original", (10,20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        vw.write(np.hstack([orig, annotated]))
+
+        # Drop a track's trail once its own history is finished (after drawing
+        # its final point this frame), so it disappears instead of lingering
+        # frozen on screen for the rest of the video.
+        for tid in [t for t in trails if cur >= last_frame_of.get(t, -1)]:
+            del trails[tid]
+
+    cap.release()
+    vw.release()
+    print(f"Wrote: {out_path}  ({len(rolling_histories)} rolling tracks highlighted)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -184,6 +278,12 @@ def main():
     ap.add_argument("--out_csv", type=str, default="rolling_stopgo.csv")
     ap.add_argument("--debug_video", type=str, default=None)
     ap.add_argument("--draw_detections", action="store_true")
+    ap.add_argument("--debug_video_rolling_only", type=str, default=None,
+                    help="Second-pass debug video showing ONLY the tracks that ended up "
+                         "classified 'rolling', each with a fading trail of its own path, "
+                         "instead of every track on screen at once (with 50-100+ simultaneous "
+                         "IDs, following one specific track by eye in the regular --debug_video "
+                         "is nearly impossible even when the tracking itself is correct).")
     args = ap.parse_args()
 
     if args.use_watershed_split:
@@ -233,6 +333,8 @@ def main():
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         vw = cv2.VideoWriter(args.debug_video, fourcc, fps, (2 * W, H))
 
+    rolling_histories = {}  # track_id -> history, only for classification=="rolling"
+
     def finalize(tid, st):
         stats = analyze_trajectory(st["history"], fps, args.frame_stride,
                                     args.stop_px, args.min_stop_frames, args.m_per_px,
@@ -245,6 +347,8 @@ def main():
             track_id=tid, first_frame=first_frame, last_frame=last_frame,
             seen_count=len(st["history"]), duration_s=(last_frame-first_frame)/fps,
             start_x=sx, start_y=sy, end_x=ex, end_y=ey, **stats))
+        if stats["classification"] == "rolling":
+            rolling_histories[tid] = list(st["history"])
 
     prev_gray = None
     cap.set(cv2.CAP_PROP_POS_FRAMES, warmup_start)
@@ -365,6 +469,10 @@ def main():
     print(f"Wrote: {args.out_csv}  ({len(df)} tracks analyzed)")
     if len(df):
         print(df["classification"].value_counts().to_string())
+
+    if args.debug_video_rolling_only:
+        render_rolling_highlight(args.video, rolling_histories, fps, args.frame_stride,
+                                 warmup_start, args.debug_video_rolling_only, args.stop_px)
 
 
 if __name__ == "__main__":
