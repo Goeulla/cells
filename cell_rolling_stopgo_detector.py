@@ -260,7 +260,32 @@ def main():
         for tid in tracks:
             tracks[tid]["updated"] = False
 
-        pairs, unmatched = hungarian_match(tracks, detections, args.max_dist)
+        # Match against each track's PREDICTED next position (linearly extrapolated
+        # from its own last real step), not its last known position. Confirmed
+        # necessary: matching on raw last-position can't tell "this cell is still
+        # here" from "a different, faster cell just passed through here" -- a
+        # genuinely stopped cell's own detection can get stolen by a passing
+        # free-flowing cell that wanders within max_dist of where the stopped cell
+        # used to be, creating a fake stop-then-jump-then-stop pattern that isn't
+        # real. A track with near-zero recent velocity predicts staying near-zero,
+        # so a fast passer (far from that prediction) won't win the match just for
+        # being spatially close. Tradeoff: right at a genuine stop->release moment,
+        # the prediction (still based on the stopped period) can undershoot the
+        # real jump enough to miss the match for one frame, splitting that cell
+        # into two track IDs instead of one continuous "rolling" track -- less
+        # harmful than the false-positive this fixes, but worth knowing about.
+        tracks_for_matching = {}
+        for tid, st in tracks.items():
+            hist = st["history"]
+            if len(hist) >= 2:
+                _, x0, y0 = hist[-2]
+                _, x1, y1 = hist[-1]
+                pred_cx, pred_cy = x1 + (x1 - x0), y1 + (y1 - y0)
+            else:
+                pred_cx, pred_cy = st["cx"], st["cy"]
+            tracks_for_matching[tid] = dict(st, cx=pred_cx, cy=pred_cy)
+
+        pairs, unmatched = hungarian_match(tracks_for_matching, detections, args.max_dist)
 
         for tid, j in pairs:
             cx, cy, _is_streak, _is_dead = detections[j]
