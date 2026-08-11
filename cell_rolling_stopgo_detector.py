@@ -208,7 +208,7 @@ def main():
     vw = None
     if args.debug_video:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        vw = cv2.VideoWriter(args.debug_video, fourcc, fps, (W, H))
+        vw = cv2.VideoWriter(args.debug_video, fourcc, fps, (2 * W, H))
 
     def finalize(tid, st):
         stats = analyze_trajectory(st["history"], fps, args.frame_stride,
@@ -309,10 +309,11 @@ def main():
                     tracks.pop(tid, None)
 
         if vw is not None:
-            left = frame.copy()
+            orig = frame.copy()
+            annotated = frame.copy()
             if args.draw_detections:
                 for (x,y,w,h,is_s,is_dead) in det_boxes:
-                    cv2.rectangle(left,(x,y),(x+w,y+h),(255,0,255),1)
+                    cv2.rectangle(annotated,(x,y),(x+w,y+h),(255,0,255),1)
             for tid, st in tracks.items():
                 hist = st["history"]
                 if len(hist) >= 2:
@@ -320,12 +321,14 @@ def main():
                     col = (0,0,255) if d <= args.stop_px else (0,255,0)  # red=stopped, green=moving
                 else:
                     col = (255,255,0)
-                cv2.circle(left, (st["cx"], st["cy"]), 3, col, -1)
-                cv2.putText(left, str(tid), (st["cx"]+4, st["cy"]-4),
+                cv2.circle(annotated, (st["cx"], st["cy"]), 3, col, -1)
+                cv2.putText(annotated, str(tid), (st["cx"]+4, st["cy"]-4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
-            cv2.putText(left, f"t={cur_frame/fps:.1f}s trk={len(tracks)}",
+            cv2.putText(annotated, f"t={cur_frame/fps:.1f}s trk={len(tracks)}",
                         (10,20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-            vw.write(left)
+            cv2.putText(orig, "original", (10,20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+            vw.write(np.hstack([orig, annotated]))
 
     for tid, st in list(tracks.items()):
         finalize(tid, st)
