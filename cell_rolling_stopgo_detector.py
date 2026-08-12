@@ -296,6 +296,20 @@ def main():
     ap.add_argument("--watershed_min_peak_dist", type=float, default=None)
     ap.add_argument("--watershed_prominence_frac", type=float, default=0.25)
     ap.add_argument("--watershed_fg_thresh", type=float, default=0.7)
+    ap.add_argument("--watershed_min_split_area", type=float, default=None,
+                    help="Blobs smaller than this skip watershed splitting entirely and use "
+                         "their own centroid. NOT free: measured directly on F_1_5_6.mp4, "
+                         "raising this from the counting script's default fallback (1.8x "
+                         "--min_area, ~22px there) to 200 gave a real 2.6x speedup (watershed "
+                         "splitting was 93%% of total runtime by profiling) but also dropped "
+                         "rolling-classified tracks 62->54 (-13%) and total tracks 1927->1567 "
+                         "(-19%) on a 10s test window -- some genuine touching-cell pairs whose "
+                         "combined area falls below the threshold are no longer being split, "
+                         "not just redundant work being skipped. Treat this as a real speed-vs-"
+                         "completeness trade-off: check your own footage's blob-area distribution "
+                         "and pick a value comfortably below your smallest real touching-cell-pair "
+                         "area, and sanity-check classification counts on a short window before "
+                         "trusting it for a full run.")
 
     # Tracking.
     ap.add_argument("--max_dist", type=float, default=500,
@@ -391,7 +405,9 @@ def main():
 
     # detect_cells() also reads these -- not exposed as CLI flags here since this tool
     # isn't about dead-cell/streak classification, just fixed off/neutral.
-    for name, val in [("watershed_min_split_area", None), ("watershed_est_cell_area", None),
+    # (watershed_min_split_area IS a real CLI flag above -- not included in this
+    # neutral-value loop, which would otherwise silently overwrite it back to None.)
+    for name, val in [("watershed_est_cell_area", None),
                        ("exclude_hole_blobs", False), ("min_mean_intensity", 0.0),
                        ("min_local_motion", 0.0), ("enable_streak", False),
                        ("streak_min_area", 6), ("streak_min_len", 4), ("streak_ar", 2.2),
