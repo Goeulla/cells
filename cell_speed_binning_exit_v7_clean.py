@@ -1188,6 +1188,20 @@ def main():
         is_dead_cell = st["dead_count"] * 2 >= st["seen_count"]
         if is_dead_cell:
             dead_cell_counts[tb] += 1
+        # Mean x/y radius across the track's own lifetime, not just its last frame --
+        # matches Oh et al. 2015 (J Cell Sci 128:3731-3743)'s "mean x and y cell
+        # radius ... measured during the course of tracking each cell", used there
+        # (their Eqn 1) as yvel/0.5(rx+ry) to normalize a cell's height above the
+        # substrate by its own size. rx/ry here are bounding-box half-width/height
+        # per detection (already computed by detect_cells for every blob, so this
+        # is free -- no new per-frame detection work), averaged over seen_count.
+        mean_rx = st["sum_rx"] / st["seen_count"]
+        mean_ry = st["sum_ry"] / st["seen_count"]
+        mean_r  = (mean_rx + mean_ry) / 2.0
+        if args.m_per_px:
+            mean_rx *= args.m_per_px
+            mean_ry *= args.m_per_px
+            mean_r  *= args.m_per_px
         # Always record a per_rows entry regardless of which bucket it landed in --
         # short_track/streak cells are the ones most likely to be noise (only tracked
         # a frame or two), so they're exactly the ones worth being able to verify,
@@ -1198,6 +1212,8 @@ def main():
                 seen_count=st["seen_count"], is_streak=int(st["is_streak"]),
                 is_dead_cell=int(is_dead_cell),
                 speed=v, speed_unit="m/s" if args.m_per_px else "px/s",
+                mean_rx=mean_rx, mean_ry=mean_ry, mean_r=mean_r,
+                radius_unit="m" if args.m_per_px else "px",
                 time_exit_s_abs=t_abs, time_exit_s_rel=t_rel,
                 x_exit=x_e, y_exit=y_e))
         return True, True
@@ -1350,6 +1366,7 @@ def main():
 
             for tid, j in pairs:
                 cx, cy, is_streak, is_dead = detections[j]
+                _, _, bw, bh, _, _ = det_boxes[j]
                 st = tracks[tid]
                 st["cx"], st["cy"] = cx, cy
                 st["last_seen_frame"] = cur_frame
@@ -1359,9 +1376,12 @@ def main():
                 st["is_streak"]    = st["is_streak"] or is_streak
                 st["dead_count"]  += 1 if is_dead else 0
                 st["end_x"], st["end_y"] = cx, cy
+                st["sum_rx"] += bw / 2.0
+                st["sum_ry"] += bh / 2.0
 
             for j in unmatched:
                 cx, cy, is_streak, is_dead = detections[j]
+                _, _, bw, bh, _, _ = det_boxes[j]
                 if args.enable_streak and is_streak:
                     while (recent_streaks
                            and cur_frame - recent_streaks[0][0] > args.streak_merge_window):
@@ -1374,7 +1394,8 @@ def main():
                     cx=cx, cy=cy, first_frame=cur_frame, last_seen_frame=cur_frame,
                     seen_count=1, missed_count=0, is_streak=bool(is_streak),
                     dead_count=1 if is_dead else 0, counted=False,
-                    updated=True, start_x=cx, start_y=cy, end_x=cx, end_y=cy)
+                    updated=True, start_x=cx, start_y=cy, end_x=cx, end_y=cy,
+                    sum_rx=bw / 2.0, sum_ry=bh / 2.0)
                 next_id += 1
 
             # Mark counted rather than deleting on crossing -- a cell that lingers in
@@ -1434,7 +1455,10 @@ def main():
             # tracker above, but only ever sees detections inside the exit-boundary band
             # (line_band_px) and uses line_dedup_dist/line_max_missed instead of
             # max_dist/max_missed for matching/expiry -- see line_tracks comment above.
-            band_detections = [d for d in detections if near_exit(d[0], d[1], args.line_band_px)]
+            band_pairs = [(d, b) for d, b in zip(detections, det_boxes)
+                          if near_exit(d[0], d[1], args.line_band_px)]
+            band_detections = [p[0] for p in band_pairs]
+            band_boxes      = [p[1] for p in band_pairs]
             if os.environ.get("DEBUG_BAND_DENSITY"):
                 print(f"t={cur_frame/fps:.3f}s det_whole_frame={len(detections)} "
                       f"det_in_band={len(band_detections)}", flush=True)
@@ -1467,6 +1491,7 @@ def main():
 
             for tid, j in pairs:
                 cx, cy, is_streak, is_dead = band_detections[j]
+                _, _, bw, bh, _, _ = band_boxes[j]
                 st = line_tracks[tid]
                 st["cx"], st["cy"] = cx, cy
                 st["last_seen_frame"] = cur_frame
@@ -1476,14 +1501,18 @@ def main():
                 st["is_streak"]    = st["is_streak"] or is_streak
                 st["dead_count"]  += 1 if is_dead else 0
                 st["end_x"], st["end_y"] = cx, cy
+                st["sum_rx"] += bw / 2.0
+                st["sum_ry"] += bh / 2.0
 
             for j in unmatched:
                 cx, cy, is_streak, is_dead = band_detections[j]
+                _, _, bw, bh, _, _ = band_boxes[j]
                 line_tracks[next_line_id] = dict(
                     cx=cx, cy=cy, first_frame=cur_frame, last_seen_frame=cur_frame,
                     seen_count=1, missed_count=0, is_streak=bool(is_streak),
                     dead_count=1 if is_dead else 0, counted=False,
-                    updated=True, start_x=cx, start_y=cy, end_x=cx, end_y=cy)
+                    updated=True, start_x=cx, start_y=cy, end_x=cx, end_y=cy,
+                    sum_rx=bw / 2.0, sum_ry=bh / 2.0)
                 next_line_id += 1
 
             # Same "mark counted, don't delete on crossing" fix as the full-frame
