@@ -709,7 +709,17 @@ def main():
     ap.add_argument("--warmup_s", type=float, default=0.0)
     ap.add_argument("--bin_seconds", type=float, default=1.0)
     ap.add_argument("--speed_bins", required=True)
-    ap.add_argument("--m_per_px", type=float, default=None)
+    ap.add_argument("--m_per_px", type=float, default=None,
+                    help="Meters per pixel -- drives EVERY real-unit calculation "
+                         "(speed, mean_r, est_height_above_bottom_um, "
+                         "predicted_wall_velocity_m_s). Unset by default (raw "
+                         "px/px-per-s units). For the 500x360 videos in this "
+                         "project (downscaled from a 1920x1440 capture "
+                         "calibrated at 0.91 um/px -- see --um_per_px's default "
+                         "and comment for the derivation and its caveats), the "
+                         "corresponding value is 3.4944e-6. Do not assume this "
+                         "matches your own video without checking its actual "
+                         "resolution and conversion history first.")
 
     # Estimated height above the substrate, back-calculated from each track's own
     # x-velocity via the parabolic (Poiseuille) flow profile between parallel
@@ -761,7 +771,7 @@ def main():
                          "Default 0 = no filtering. Checked on real footage and deliberately "
                          "left off: confirmed solid dark halo-less blobs (debris/stuck "
                          "objects) do get counted, but a threshold strong enough to exclude "
-                         "them also caught ~40% of all detections in the same dense frame, "
+                         "them also caught ~40%% of all detections in the same dense frame, "
                          "most of which looked like faint/dim real detections rather than "
                          "debris -- same false-negative risk as --min_local_motion below, and "
                          "not worth it given this assay specifically cares about slower/dimmer "
@@ -1019,7 +1029,30 @@ def main():
 
     ap.add_argument("--draw_scalebar", action="store_true")
     ap.add_argument("--scalebar_um",   type=float, default=10.0)
-    ap.add_argument("--um_per_px",     type=float, default=0.91)
+    # 0.91 um/px is the microscope's own stated calibration, but that's only
+    # valid at the ORIGINAL 1920x1440 capture resolution. Every video actually
+    # analyzed in this project is 500x360 (confirmed: an AVI->MP4 conversion
+    # step downscaled it). 1920x1440 is exactly 4:3; 500x360 is 25:18 (1.3889),
+    # a different aspect ratio -- so the conversion wasn't a pure uniform
+    # resize, something also cropped it. Width (1920/500=3.84) and height
+    # (1440/360=4.0) each imply a different scale factor if taken alone; this
+    # default assumes the width ratio is the true uniform scale (3.84x) and
+    # the height discrepancy is a separate crop (which doesn't change the
+    # px-to-real-distance ratio, only the frame extent) -- a "scale then crop"
+    # step is the more common real-world conversion workflow than a non-
+    # uniform stretch. That assumption is NOT verified -- if you know the
+    # actual crop/resize steps used, or can calibrate directly against a
+    # known real-world size in the 500x360 footage itself, prefer that over
+    # this value. 0.91 * 3.84 = 3.4944.
+    ap.add_argument("--um_per_px",     type=float, default=3.4944,
+                    help="Scalebar-only -- does NOT affect speed/mean_r/height/"
+                         "hydrodynamic calculations, those use --m_per_px "
+                         "separately (in meters/px, default unset = raw px "
+                         "units). Default here (3.4944) assumes 500x360 video "
+                         "downscaled+cropped from a 1920x1440 capture "
+                         "calibrated at 0.91 um/px -- see comment above; "
+                         "verify against your own video's actual resolution "
+                         "and conversion history before trusting it.")
 
     ap.add_argument("--no_pad_to_range_end", action="store_true")
     ap.add_argument("--out_csv",        default="speed_counts_per_time.csv")
