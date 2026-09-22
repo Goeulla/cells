@@ -710,6 +710,32 @@ def main():
     ap.add_argument("--bin_seconds", type=float, default=1.0)
     ap.add_argument("--speed_bins", required=True)
     ap.add_argument("--m_per_px", type=float, default=None)
+
+    # Estimated height above the substrate, back-calculated from each track's own
+    # x-velocity via the parabolic (Poiseuille) flow profile between parallel
+    # plates -- the same relation Oh et al. 2015 (J Cell Sci 128:3731-3743) use
+    # in their Eqn 3, inverted to solve for position instead of velocity:
+    #   vx = tau_wall/(h*mu) * (h^2/4 - y^2)   =>   y = sqrt(h^2/4 - vx*h*mu/tau_wall)
+    # y is measured from the channel CENTERLINE there (0 at center, +-h/2 at the
+    # walls); since this pipeline's whole point is rolling cells near the BOTTOM
+    # wall, the near-wall root is taken and reported as height above the bottom
+    # substrate instead: height = h/2 - y. Requires --m_per_px too, since vx must
+    # be in real units (m/s) to combine with tau_wall (Pa)/h (m)/mu (Pa.s) --
+    # px/s is not physically meaningful in this equation.
+    ap.add_argument("--shear_stress_pa", type=float, default=None,
+                    help="Wall shear stress in Pascals (convert from dyn/cm^2 by "
+                         "multiplying by 0.1). Required together with "
+                         "--chamber_height_um, --medium_viscosity_pa_s and --m_per_px "
+                         "to back-calculate each counted cell's estimated height "
+                         "above the substrate from its own x-velocity.")
+    ap.add_argument("--chamber_height_um", type=float, default=None,
+                    help="Flow chamber height in micrometers (the full gap between "
+                         "top and bottom, not a radius). Required together with "
+                         "--shear_stress_pa, --medium_viscosity_pa_s and --m_per_px.")
+    ap.add_argument("--medium_viscosity_pa_s", type=float, default=None,
+                    help="Dynamic viscosity of the perfusion medium in Pa.s (water "
+                         "at room temperature is about 9e-4 Pa.s). Required together "
+                         "with --shear_stress_pa, --chamber_height_um and --m_per_px.")
     ap.add_argument("--fps",      type=float, default=None)
     ap.add_argument("--frame_stride", type=int, default=1,
                     help="Only fully process 1 out of every N frames (default 1 = every "
@@ -1027,6 +1053,20 @@ def main():
             "--use_watershed_split requires scikit-image. Install it with: "
             "pip install scikit-image")
 
+    height_params = (args.shear_stress_pa, args.chamber_height_um, args.medium_viscosity_pa_s)
+    want_height_calc = any(p is not None for p in height_params)
+    if want_height_calc:
+        if not all(p is not None for p in height_params):
+            raise SystemExit(
+                "--shear_stress_pa, --chamber_height_um and --medium_viscosity_pa_s "
+                "must all be set together to back-calculate cell height -- got only "
+                "some of them.")
+        if not args.m_per_px:
+            raise SystemExit(
+                "Estimated height back-calculation needs velocity in real units, not "
+                "px/s -- pass --m_per_px alongside --shear_stress_pa/"
+                "--chamber_height_um/--medium_viscosity_pa_s.")
+
     edges = parse_bins(args.speed_bins)
 
     cap = cv2.VideoCapture(args.video)
@@ -1076,6 +1116,7 @@ def main():
     short_track_counts = defaultdict(int)
     dead_cell_counts   = defaultdict(int)
     per_rows = []
+    n_height_out_of_range = [0]  # v faster than the theoretical mid-channel max -- see height calc below
 
     # --count_at_line: a second, independent tracks-like dict scoped only to
     # detections inside the narrow band near the exit boundary (args.line_band_px).
@@ -1202,12 +1243,38 @@ def main():
             mean_rx *= args.m_per_px
             mean_ry *= args.m_per_px
             mean_r  *= args.m_per_px
+        # Estimated height above the substrate, back-calculated from this track's
+        # own x-velocity via the parabolic flow profile between parallel plates --
+        # see Oh et al. 2015 (J Cell Sci 128:3731-3743) Eqn 3, inverted:
+        #   vx = tau_wall/(h*mu) * (h^2/4 - y^2)  =>  y = sqrt(h^2/4 - vx*h*mu/tau_wall)
+        # y is measured from the channel CENTERLINE (0 at center, +-h/2 at the
+        # walls) in their convention. This pipeline only cares about cells near
+        # the BOTTOM wall (that's what "rolling" means here), so the near-wall
+        # root is taken and reported as height above the bottom substrate:
+        # height = h/2 - y. If the measured velocity exceeds the theoretical
+        # mid-channel maximum (tau_wall*h/(4*mu)) for the given parameters, the
+        # profile has no real solution for this cell (bad calibration, or a cell
+        # not actually following simple near-wall shear) -- reported as NaN
+        # rather than silently returning a wrong number, and tallied so the run
+        # summary can flag if this is happening often.
+        est_height_above_bottom_um = float("nan")
+        if want_height_calc:
+            h_m   = args.chamber_height_um * 1e-6
+            mu    = args.medium_viscosity_pa_s
+            tau   = args.shear_stress_pa
+            disc  = (h_m ** 2) / 4.0 - v * h_m * mu / tau
+            if disc >= 0:
+                y_from_center = math.sqrt(disc)          # near-wall root, distance from centerline
+                height_m = h_m / 2.0 - y_from_center      # height above the bottom substrate
+                est_height_above_bottom_um = height_m * 1e6
+            else:
+                n_height_out_of_range[0] += 1
         # Always record a per_rows entry regardless of which bucket it landed in --
         # short_track/streak cells are the ones most likely to be noise (only tracked
         # a frame or two), so they're exactly the ones worth being able to verify,
         # not ones to silently omit from per_object_csv/--verify_crossings_out.
         if args.per_object_csv or args.verify_crossings_out:
-            per_rows.append(dict(
+            row = dict(
                 track_id=tid, final_reason=reason, counted_as=counted_as,
                 seen_count=st["seen_count"], is_streak=int(st["is_streak"]),
                 is_dead_cell=int(is_dead_cell),
@@ -1215,7 +1282,10 @@ def main():
                 mean_rx=mean_rx, mean_ry=mean_ry, mean_r=mean_r,
                 radius_unit="m" if args.m_per_px else "px",
                 time_exit_s_abs=t_abs, time_exit_s_rel=t_rel,
-                x_exit=x_e, y_exit=y_e))
+                x_exit=x_e, y_exit=y_e)
+            if want_height_calc:
+                row["est_height_above_bottom_um"] = est_height_above_bottom_um
+            per_rows.append(row)
         return True, True
 
     while True:
@@ -1669,6 +1739,12 @@ def main():
     print("Wrote:", xl)
     if args.per_object_csv:
         print("Wrote:", args.per_object_csv)
+    if want_height_calc and n_height_out_of_range[0] > 0:
+        print(f"Note: {n_height_out_of_range[0]} counted cell(s) had a measured velocity "
+              f"faster than the theoretical mid-channel maximum for the given "
+              f"--shear_stress_pa/--chamber_height_um/--medium_viscosity_pa_s -- "
+              f"est_height_above_bottom_um is NaN for those rows (no real solution "
+              f"under simple parabolic flow with these parameters).")
     if args.verify_crossings_out:
         save_crossing_contact_sheet(args.video, per_rows, fps, args.verify_crossings_out)
 
