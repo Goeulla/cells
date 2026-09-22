@@ -420,7 +420,11 @@ def main():
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
         raise SystemExit(f"Cannot open: {args.video}")
-    fps = args.fps or cap.get(cv2.CAP_PROP_FPS) or 30.0
+    # 20.0, not 30.0 -- last-resort fallback only (args.fps overrides it, and
+    # a file's own reported fps overrides it too). Every video actually used
+    # in this project measured at ~20-20.45fps, not 30; this only matters if
+    # a file fails to report any fps at all.
+    fps = args.fps or cap.get(cv2.CAP_PROP_FPS) or 20.0
 
     start_s = max(0.0, args.start_s)
     start_frame = int(start_s * fps)
