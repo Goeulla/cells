@@ -1269,6 +1269,29 @@ def main():
                 est_height_above_bottom_um = height_m * 1e6
             else:
                 n_height_out_of_range[0] += 1
+        # Predicted near-wall rolling velocity, from classic Goldman-Cox-Brenner
+        # hydrodynamics for a sphere translating in contact with (or very close
+        # to) a wall in shear flow: hydrodynamic wall drag hinders the particle
+        # below the undisturbed local fluid velocity, commonly approximated as
+        #   V ~= 0.7 * shear_rate_wall * radius
+        # (shear_rate_wall = tau_wall/mu for a Newtonian fluid). This is a
+        # DIFFERENT calculation from the height back-calc above -- that one
+        # treats the cell as a passive tracer point at some height y and solves
+        # for y from the undisturbed flow profile; this one assumes the cell is
+        # actually rolling at/near the wall and predicts its expected velocity
+        # from its own measured radius (mean_r above), independent of height or
+        # --chamber_height_um. Comparing it against this track's real measured
+        # speed is the useful part: close to 1 supports genuine near-wall
+        # rolling; far from 1 suggests the cell is more elevated/free-flowing,
+        # or that something other than simple shear hydrodynamics is going on
+        # (an active adhesive pause, for instance).
+        predicted_wall_velocity_m_s = float("nan")
+        speed_to_predicted_ratio = float("nan")
+        if want_height_calc:
+            shear_rate_wall = args.shear_stress_pa / args.medium_viscosity_pa_s  # 1/s
+            predicted_wall_velocity_m_s = 0.7 * shear_rate_wall * mean_r  # mean_r already in meters here
+            if predicted_wall_velocity_m_s > 0:
+                speed_to_predicted_ratio = v / predicted_wall_velocity_m_s
         # Always record a per_rows entry regardless of which bucket it landed in --
         # short_track/streak cells are the ones most likely to be noise (only tracked
         # a frame or two), so they're exactly the ones worth being able to verify,
@@ -1285,6 +1308,8 @@ def main():
                 x_exit=x_e, y_exit=y_e)
             if want_height_calc:
                 row["est_height_above_bottom_um"] = est_height_above_bottom_um
+                row["predicted_wall_velocity_m_s"] = predicted_wall_velocity_m_s
+                row["speed_to_predicted_ratio"] = speed_to_predicted_ratio
             per_rows.append(row)
         return True, True
 
