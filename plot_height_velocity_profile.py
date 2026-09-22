@@ -20,17 +20,18 @@ at that point (e.g. still within an entrance/settling region).
 to be wrong: that curve treats the cell as a massless point tracer in the
 UNDISTURBED flow, which ignores hydrodynamic wall drag -- a real, finite-sized
 particle within about 2 radii of the wall (y < 2a) moves measurably slower than
-the undisturbed local fluid velocity there (Goldman, Cox & Brenner 1967). We only
-have a rigorously defensible correction at one specific point, not a continuous
-function across the whole band: a sphere actually in contact with the wall
-(y=a) translates at approximately V ~= 0.7 * shear_rate_wall * a (the same
-relation used for predicted_wall_velocity_m_s in the main script). The plot
-shades the y<2a region to flag it as unreliable for the naive curve, and marks
-the two competing predictions at y=a side by side -- it deliberately does NOT
-draw a continuous "corrected" curve through that band, since we don't have a
-verified closed-form for the correction factor at intermediate 0<y<2a
-(that requires Goldman-Cox-Brenner's full tabulated/numerical results, not just
-the contact-point approximation).
+the undisturbed local fluid velocity there (Goldman, Cox & Brenner 1967). Two
+corrections are drawn:
+
+  - A continuous curve, valid for y >= a (below that the sphere overlaps the
+    wall): V = y * shear_rate_wall * (1 - (5/16)*(a/y)^3) -- the leading-order
+    Faxen-type wall correction to the local linear shear velocity.
+  - A single reference point at y=a (contact): V ~= 0.7 * shear_rate_wall * a
+    (the same relation used for predicted_wall_velocity_m_s in the main
+    script). At y=a the continuous curve above gives a factor of (1-5/16) =
+    0.6875 instead of 0.7 -- close but not identical, since they come from
+    different approximations; shown together as a cross-check, not because
+    they're expected to match exactly.
 """
 import argparse
 import numpy as np
@@ -48,6 +49,16 @@ def velocity_profile(height_above_bottom_um, chamber_height_um, shear_stress_pa,
     h_m = chamber_height_um * 1e-6
     y_from_center_m = height_above_bottom_um * 1e-6 - h_m / 2.0
     vx_m_s = shear_stress_pa / (h_m * viscosity_pa_s) * (h_m**2 / 4.0 - y_from_center_m**2)
+    return vx_m_s * 1e6  # um/s
+
+
+def near_wall_corrected_velocity(height_above_bottom_um, radius_um, shear_stress_pa, viscosity_pa_s):
+    """V = y*shear_rate*(1 - (5/16)*(a/y)^3) -- only valid for y >= a (a sphere
+    can't have its center closer to the wall than its own radius)."""
+    shear_rate = shear_stress_pa / viscosity_pa_s  # 1/s
+    y_m = height_above_bottom_um * 1e-6
+    a_m = radius_um * 1e-6
+    vx_m_s = y_m * shear_rate * (1.0 - (5.0 / 16.0) * (a_m / y_m) ** 3)
     return vx_m_s * 1e6  # um/s
 
 
@@ -103,18 +114,24 @@ def main():
 
     if radius_um is not None:
         shear_rate_wall = args.shear_stress_pa / args.medium_viscosity_pa_s  # 1/s
-        v_corrected_um_s = 0.7 * shear_rate_wall * (radius_um * 1e-6) * 1e6
+
+        height_corrected_um = np.linspace(radius_um, h, 400)  # only valid for y>=a
+        vx_corrected_um_s = near_wall_corrected_velocity(height_corrected_um, radius_um,
+                                                          args.shear_stress_pa,
+                                                          args.medium_viscosity_pa_s)
+        ax.plot(vx_corrected_um_s, height_corrected_um, color=RED, linewidth=2, zorder=3,
+                label="Wall-drag-corrected: y·γ̇·(1-(5/16)(a/y)³)")
+
+        v_corrected_at_a = 0.7 * shear_rate_wall * (radius_um * 1e-6) * 1e6
         v_naive_at_a = velocity_profile(np.array([radius_um]), h, args.shear_stress_pa,
                                         args.medium_viscosity_pa_s)[0]
-        ax.plot([v_naive_at_a, v_corrected_um_s], [radius_um, radius_um],
-                color=RED, linewidth=1, linestyle="-", zorder=4, alpha=0.6)
         ax.scatter([v_naive_at_a], [radius_um], s=60, color=BLUE, zorder=5,
                    edgecolors="white", linewidths=1, marker="o",
                    label=f"Naive prediction at y=a: {v_naive_at_a:.1f} µm/s")
-        ax.scatter([v_corrected_um_s], [radius_um], s=70, color=RED, zorder=5,
+        ax.scatter([v_corrected_at_a], [radius_um], s=70, color="#7a1f14", zorder=5,
                    edgecolors="white", linewidths=1, marker="D",
-                   label=f"Wall-drag-corrected at y=a (contact, 0.7×γ̇×a): "
-                         f"{v_corrected_um_s:.1f} µm/s")
+                   label=f"Contact-point reference (0.7×γ̇×a): "
+                         f"{v_corrected_at_a:.1f} µm/s")
 
     if df is not None:
         if "est_height_above_bottom_um" in df.columns:
