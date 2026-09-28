@@ -760,12 +760,16 @@ def main():
                          "(speed, mean_r, est_height_above_bottom_um, "
                          "predicted_wall_velocity_m_s). Unset by default (raw "
                          "px/px-per-s units). For the 500x360 videos in this "
-                         "project (downscaled from a 1920x1440 capture "
-                         "calibrated at 0.91 um/px -- see --um_per_px's default "
-                         "and comment for the derivation and its caveats), the "
-                         "corresponding value is 3.4944e-6. Do not assume this "
-                         "matches your own video without checking its actual "
-                         "resolution and conversion history first.")
+                         "project, directly measured from an on-screen 20um "
+                         "microscope scale bar (Sample.mp4): the bar's bounding "
+                         "box is exactly 8px wide, stable across widely-spaced "
+                         "frames -- 20/8 = 2.5 um/px, so the corresponding value "
+                         "here is 2.5e-6. This supersedes an earlier unverified "
+                         "guess (3.4944e-6, a width-ratio assumption from the "
+                         "microscope's 0.91 um/px @ 1920x1440 spec) -- see "
+                         "--um_per_px's default and comment. Do not assume "
+                         "either matches your own video without checking its "
+                         "own scale bar or conversion history first.")
 
     # Estimated height above the substrate, back-calculated from each track's own
     # x-velocity via the parabolic (Poiseuille) flow profile between parallel
@@ -1089,30 +1093,24 @@ def main():
 
     ap.add_argument("--draw_scalebar", action="store_true")
     ap.add_argument("--scalebar_um",   type=float, default=10.0)
-    # 0.91 um/px is the microscope's own stated calibration, but that's only
-    # valid at the ORIGINAL 1920x1440 capture resolution. Every video actually
-    # analyzed in this project is 500x360 (confirmed: an AVI->MP4 conversion
-    # step downscaled it). 1920x1440 is exactly 4:3; 500x360 is 25:18 (1.3889),
-    # a different aspect ratio -- so the conversion wasn't a pure uniform
-    # resize, something also cropped it. Width (1920/500=3.84) and height
-    # (1440/360=4.0) each imply a different scale factor if taken alone; this
-    # default assumes the width ratio is the true uniform scale (3.84x) and
-    # the height discrepancy is a separate crop (which doesn't change the
-    # px-to-real-distance ratio, only the frame extent) -- a "scale then crop"
-    # step is the more common real-world conversion workflow than a non-
-    # uniform stretch. That assumption is NOT verified -- if you know the
-    # actual crop/resize steps used, or can calibrate directly against a
-    # known real-world size in the 500x360 footage itself, prefer that over
-    # this value. 0.91 * 3.84 = 3.4944.
-    ap.add_argument("--um_per_px",     type=float, default=3.4944,
+    # Measured directly from Sample.mp4 (500x360, same resolution as the videos
+    # actually analyzed in this project): the microscope's own on-screen 20um
+    # scale bar has a bounding box exactly 8px wide, confirmed identical across
+    # 5 widely-spaced frames (0, 100, 300, 600, 900) -- a static overlay, not
+    # noise. 20/8 = 2.5 um/px. This supersedes an earlier unverified guess of
+    # 3.4944 (a width-ratio assumption from the microscope's stated 0.91 um/px
+    # @ 1920x1440 spec, before we had a real in-frame reference) -- that guess
+    # was off by ~40%. Re-measure against your own video's own scale bar if it
+    # has one; don't assume 2.5 transfers to a different resolution/magnification.
+    ap.add_argument("--um_per_px",     type=float, default=2.5,
                     help="Scalebar-only -- does NOT affect speed/mean_r/height/"
                          "hydrodynamic calculations, those use --m_per_px "
                          "separately (in meters/px, default unset = raw px "
-                         "units). Default here (3.4944) assumes 500x360 video "
-                         "downscaled+cropped from a 1920x1440 capture "
-                         "calibrated at 0.91 um/px -- see comment above; "
-                         "verify against your own video's actual resolution "
-                         "and conversion history before trusting it.")
+                         "units). Default here (2.5) is measured directly from "
+                         "an on-screen 20um scale bar in Sample.mp4 (500x360, "
+                         "same resolution as this project's analyzed footage) "
+                         "-- see comment above; verify against your own video's "
+                         "own scale bar before trusting it.")
 
     ap.add_argument("--no_pad_to_range_end", action="store_true")
     ap.add_argument("--out_csv",        default="speed_counts_per_time.csv")
