@@ -368,7 +368,7 @@ def local_blob_sharpness(gray, cx, cy, radius):
     return cv2.Laplacian(patch, cv2.CV_64F).var()
 
 
-def measure_core_size(gray, x, y, w, h, frac=0.8, margin=10):
+def measure_core_size(gray, x, y, w, h, frac=0.75, margin=10):
     """
     Real cell size, for mean_rx/mean_ry/mean_r specifically -- NOT used for
     detection/tracking, which keeps using the full (x,y,w,h) MOG2 blob as
@@ -388,11 +388,17 @@ def measure_core_size(gray, x, y, w, h, frac=0.8, margin=10):
     within the already-detected blob's local neighborhood, take only pixels
     within the top (1-frac) fraction of the local peak-above-background
     contrast (local background = the median intensity in a margin-px ring
-    around the blob, not the whole frame, so it adapts per-cell). Validated
-    directly on real footage: frac=0.8 gives a median core diameter of
-    ~10.5um against an expected ~10um T-cell diameter, with zero detections
-    lost at any fraction tested (this only ever refines size, never whether
-    something is detected at all).
+    around the blob, not the whole frame, so it adapts per-cell). frac is a
+    FIT, not an independent measurement -- there's no ground-truth cell
+    boundary in this footage, only your stated ~10um expected diameter, so
+    frac was swept and the value closest to that expectation was kept. At
+    the current default (0.75), using the scale-bar-measured 2.5 um/px
+    calibration (--m_per_px), real footage gives a median core diameter of
+    ~9.85um (range 9.06-10.22um across 11 cells), with zero detections lost
+    at any fraction tested (this only ever refines size, never whether
+    something is detected at all). If --m_per_px changes, re-sweep this --
+    it was tuned against one specific px-to-um ratio, not derived from
+    anything that stays valid independent of it.
     """
     H, W = gray.shape[:2]
     y0, y1 = max(0, y - margin), min(H, y + h + margin)
@@ -812,7 +818,7 @@ def main():
 
     ap.add_argument("--min_area",   type=float, default=12)
     ap.add_argument("--max_area",   type=float, default=8000)
-    ap.add_argument("--core_size_frac", type=float, default=0.8,
+    ap.add_argument("--core_size_frac", type=float, default=0.75,
                     help="mean_rx/mean_ry/mean_r are measured from each detected "
                          "blob's bright CORE, not its full MOG2 mask extent -- the "
                          "mask typically includes a dim halo well beyond the cell's "
@@ -822,10 +828,19 @@ def main():
                          "local peak-above-background contrast a pixel must clear to "
                          "count as core; higher = tighter/smaller. Does NOT affect "
                          "detection/tracking/counting at all, only these three size "
-                         "columns. Default (0.8) was validated on real footage "
-                         "against a known ~10um T-cell diameter -- re-validate "
-                         "against your own footage's known cell size rather than "
-                         "assuming it transfers directly.")
+                         "columns -- confirmed directly: re-running old vs. new code "
+                         "on the same footage found the identical 11 tracks, same "
+                         "speeds, same exit times, only mean_r changed. Default "
+                         "(0.75) is fit, not independently derived -- it's whichever "
+                         "value lands closest to your stated ~10um T-cell diameter, "
+                         "using --m_per_px's measured 2.5 um/px scale-bar "
+                         "calibration (re-tuned from an earlier 0.8 default that was "
+                         "fit against the prior, wrong 3.4944 um/px guess). At 0.75 "
+                         "on real footage: median diameter 9.85um (range "
+                         "9.06-10.22um across 11 cells). Re-validate against an "
+                         "independent reference (a calibration bead, or manual "
+                         "pixel measurement on a zoomed still frame) rather than "
+                         "trusting this transfers to your own footage.")
     ap.add_argument("--max_dist",   type=float, default=220)
     ap.add_argument("--max_missed", type=int,   default=20)
     ap.add_argument("--min_mean_intensity", type=float, default=0.0,
