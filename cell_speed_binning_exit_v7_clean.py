@@ -766,16 +766,26 @@ def main():
                          "(speed, mean_r, est_height_above_bottom_um, "
                          "predicted_wall_velocity_m_s). Unset by default (raw "
                          "px/px-per-s units). For the 500x360 videos in this "
-                         "project, directly measured from an on-screen 20um "
-                         "microscope scale bar (Sample.mp4): the bar's bounding "
-                         "box is exactly 8px wide, stable across widely-spaced "
-                         "frames -- 20/8 = 2.5 um/px, so the corresponding value "
-                         "here is 2.5e-6. This supersedes an earlier unverified "
-                         "guess (3.4944e-6, a width-ratio assumption from the "
-                         "microscope's 0.91 um/px @ 1920x1440 spec) -- see "
-                         "--um_per_px's default and comment. Do not assume "
-                         "either matches your own video without checking its "
-                         "own scale bar or conversion history first.")
+                         "project, measured directly from a certified-diameter "
+                         "reference: a Dynabeads Human T-Activator CD3/CD28 "
+                         "(Gibco, 4.5um) imaged on the same setup measures ~4.84px "
+                         "across -- 4.5/4.84 = 0.93 um/px, so the corresponding "
+                         "value here is 0.93e-6. Nearly identical to the "
+                         "microscope's own originally-stated 0.91 um/px @ "
+                         "1920x1440 -- consistent with the 500x360 export being a "
+                         "straight CROP of the original sensor, not a resize, so "
+                         "the original per-pixel calibration carries over "
+                         "unchanged. This supersedes an on-screen 20um scale-bar "
+                         "overlay that implied 2.5 um/px (measuring the bar's "
+                         "rendered pixel width, 8px, precisely) -- that overlay's "
+                         "own rendering was crisp, but the underlying calibration "
+                         "constant it was drawn from is apparently stale, "
+                         "probably left over from a prior objective/session "
+                         "configuration; rendering precision doesn't validate a "
+                         "stale source value. Do not assume 0.93 matches your own "
+                         "video -- re-measure against your own known-size "
+                         "reference, not any on-screen overlay you haven't "
+                         "independently verified.")
 
     # Estimated height above the substrate, back-calculated from each track's own
     # x-velocity via the parabolic (Poiseuille) flow profile between parallel
@@ -1108,24 +1118,30 @@ def main():
 
     ap.add_argument("--draw_scalebar", action="store_true")
     ap.add_argument("--scalebar_um",   type=float, default=10.0)
-    # Measured directly from Sample.mp4 (500x360, same resolution as the videos
-    # actually analyzed in this project): the microscope's own on-screen 20um
-    # scale bar has a bounding box exactly 8px wide, confirmed identical across
-    # 5 widely-spaced frames (0, 100, 300, 600, 900) -- a static overlay, not
-    # noise. 20/8 = 2.5 um/px. This supersedes an earlier unverified guess of
-    # 3.4944 (a width-ratio assumption from the microscope's stated 0.91 um/px
-    # @ 1920x1440 spec, before we had a real in-frame reference) -- that guess
-    # was off by ~40%. Re-measure against your own video's own scale bar if it
-    # has one; don't assume 2.5 transfers to a different resolution/magnification.
-    ap.add_argument("--um_per_px",     type=float, default=2.5,
+    # Measured from a certified-diameter reference imaged on this same setup
+    # (Dynabead.mp4, 500x360): a Dynabeads Human T-Activator CD3/CD28 (Gibco,
+    # 4.5um certified diameter) measures ~4.84px across -- 4.5/4.84 = 0.93 um/px.
+    # This nearly exactly matches the microscope's own originally-stated
+    # 0.91 um/px @ 1920x1440, consistent with the 500x360 export being a
+    # straight CROP of the original sensor (not a resize), so the original
+    # per-pixel calibration carries over unchanged. This supersedes an
+    # on-screen 20um scale-bar overlay that implied 2.5 um/px: that overlay
+    # rendered its own pixel width (8px) crisply, but crisp rendering only
+    # proves the bar was drawn precisely FROM whatever calibration constant
+    # the acquisition software had stored -- it says nothing about whether
+    # that stored constant is still correct, and it apparently wasn't (likely
+    # stale from a prior objective/session config). Re-measure against your
+    # own known-size reference; don't trust an on-screen overlay you haven't
+    # independently verified against something of truly known size.
+    ap.add_argument("--um_per_px",     type=float, default=0.93,
                     help="Scalebar-only -- does NOT affect speed/mean_r/height/"
                          "hydrodynamic calculations, those use --m_per_px "
                          "separately (in meters/px, default unset = raw px "
-                         "units). Default here (2.5) is measured directly from "
-                         "an on-screen 20um scale bar in Sample.mp4 (500x360, "
+                         "units). Default here (0.93) is measured directly from "
+                         "a certified 4.5um Dynabead in Dynabead.mp4 (500x360, "
                          "same resolution as this project's analyzed footage) "
                          "-- see comment above; verify against your own video's "
-                         "own scale bar before trusting it.")
+                         "own known-size reference before trusting it.")
 
     ap.add_argument("--no_pad_to_range_end", action="store_true")
     ap.add_argument("--out_csv",        default="speed_counts_per_time.csv")
