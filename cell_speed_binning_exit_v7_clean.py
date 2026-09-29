@@ -877,6 +877,29 @@ def main():
                          "Takes priority over the file's own reported fps, but an "
                          "explicit --fps (if you already know the correct value some "
                          "other way) takes priority over this.")
+    # Confirmed by the user across 4 independent recordings of very different
+    # lengths (90min->103min, 30min->34min, 10min->11.5min, 10s->11s): the
+    # file's declared-duration inflation is a consistent RATIO (1.10-1.15,
+    # mean 1.132), not a fixed offset (the offsets ranged from 1s to 240s --
+    # no consistent additive pattern at all). A ratio this stable across
+    # timescales this different is the signature of the camera's own true
+    # frame-capture interval running slightly off from whatever rate its
+    # firmware assumes when writing timestamps, not measurement noise. Applied
+    # automatically by default so every run is corrected without having to
+    # time and re-enter --true_duration_min for every single video -- pass
+    # --true_duration_min instead whenever you do know the exact true time
+    # for a specific recording (exact beats this project-wide average), or
+    # --duration_inflation_ratio 1.0 to disable this correction entirely.
+    ap.add_argument("--duration_inflation_ratio", type=float, default=1.132,
+                    help="declared_duration/true_duration, averaged from 4 of this "
+                         "project's own recordings (see comment above). fps is "
+                         "corrected as file_reported_fps * this ratio. Only applied "
+                         "when neither --fps nor --true_duration_min is given (both "
+                         "are exact for their specific video; this is a project-wide "
+                         "average with a real ~5%% spread across the 4 measurements "
+                         "it's based on -- prefer --true_duration_min when you know "
+                         "the real number for that recording). Re-measure this ratio "
+                         "against your own equipment before trusting it elsewhere.")
     ap.add_argument("--frame_stride", type=int, default=1,
                     help="Only fully process 1 out of every N frames (default 1 = every "
                          "frame); the other N-1 are cheaply skipped via cap.grab() (no "
@@ -1276,27 +1299,39 @@ def main():
     if not cap.isOpened():
         raise SystemExit(f"Cannot open: {args.video}")
     # Priority: explicit --fps (if you already know the right value) > fps derived
-    # from --true_duration_min (the file's own declared duration is known-wrong on
-    # this project's microscope, see --true_duration_min's help) > the file's own
-    # reported fps > 20.0 last-resort fallback (every video actually used in this
-    # project measured at ~20-20.45fps, not 30; this only matters if a file fails
-    # to report any fps at all).
+    # from --true_duration_min (exact, for a specific timed recording) >
+    # --duration_inflation_ratio correction (a project-wide average, applied
+    # automatically so every run is corrected without having to time each video
+    # by hand) > the file's own reported fps (only reached if the ratio
+    # correction is disabled via --duration_inflation_ratio 1.0) > 20.0
+    # last-resort fallback (every video actually used in this project measured
+    # at ~20-20.45fps, not 30; this only matters if a file fails to report any
+    # fps at all).
+    file_fps = cap.get(cv2.CAP_PROP_FPS)
     fps_from_true_duration = None
     if args.true_duration_min:
         nb_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
         if nb_frames and nb_frames > 0:
             fps_from_true_duration = nb_frames / (args.true_duration_min * 60.0)
             print(f"--true_duration_min given: file reports {nb_frames:.0f} frames over "
-                  f"a declared duration of {nb_frames / (cap.get(cv2.CAP_PROP_FPS) or 20.0):.1f}s, "
+                  f"a declared duration of {nb_frames / (file_fps or 20.0):.1f}s, "
                   f"but treating true duration as {args.true_duration_min * 60:.1f}s -- "
                   f"using fps={fps_from_true_duration:.4f} instead of the file's own "
-                  f"{cap.get(cv2.CAP_PROP_FPS):.4f}.")
+                  f"{file_fps:.4f}.")
         else:
             print("WARNING: --true_duration_min given but the file reports no frame "
                   "count -- falling back to the file's own fps metadata, which is "
                   "exactly what --true_duration_min exists to override. Speeds from "
                   "this run may be wrong.")
-    fps = args.fps or fps_from_true_duration or cap.get(cv2.CAP_PROP_FPS) or 20.0
+    fps_from_ratio = None
+    if not args.true_duration_min and args.duration_inflation_ratio != 1.0 and file_fps:
+        fps_from_ratio = file_fps * args.duration_inflation_ratio
+        print(f"Applying --duration_inflation_ratio {args.duration_inflation_ratio:g} "
+              f"(no --fps or --true_duration_min given): using fps={fps_from_ratio:.4f} "
+              f"instead of the file's own {file_fps:.4f}. Pass --true_duration_min "
+              f"instead if you know this specific recording's true wall-clock length, "
+              f"or --duration_inflation_ratio 1.0 to use the file's own fps unmodified.")
+    fps = args.fps or fps_from_true_duration or fps_from_ratio or file_fps or 20.0
 
     start_s     = max(0.0, args.start_s)
     start_frame = int(start_s * fps)
