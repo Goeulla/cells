@@ -1109,7 +1109,22 @@ def main():
                          "to be treated as the same crossing cell. Should comfortably cover how "
                          "long a real cell spends inside --line_band_px, not a whole trajectory.")
 
-    ap.add_argument("--exit_side",      type=str, default="right",
+    # Flow in this project's videos runs top-to-bottom, confirmed directly by the
+    # user and independently corroborated: pulling the real frame-by-frame path
+    # of a representative track showed smooth, continuous, near-monotonic motion
+    # almost entirely in y (e.g. one track moved ~250px in y vs. ~47px in x over
+    # its full lifetime) -- essentially perpendicular to the "right" default.
+    # Changing to "bottom" on real footage went from 11 tracked cells (using
+    # "right") to 1057 (using "bottom") in the same clip, with
+    # speed_to_predicted_ratio moving from an implausible ~0.01-0.24 range (which
+    # looked like severe adhesion/slowdown) to a physically sensible ~0.1-1+
+    # distribution -- "right" wasn't measuring a slow population, it was almost
+    # entirely missing the real (fast, top-to-bottom) population and only
+    # catching a rare, slow, sideways-wandering fringe that happened to also
+    # drift far enough in x. Re-verify against your own footage's actual flow
+    # direction before trusting this default -- it is specific to this project's
+    # camera/channel orientation, not a general convention.
+    ap.add_argument("--exit_side",      type=str, default="bottom",
                     choices=["right","left","top","bottom"])
     ap.add_argument("--exit_margin_px", type=int, default=10)
     ap.add_argument("--end_of_range_margin_px", type=int, default=60,
