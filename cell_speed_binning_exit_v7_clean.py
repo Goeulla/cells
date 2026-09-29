@@ -368,7 +368,7 @@ def local_blob_sharpness(gray, cx, cy, radius):
     return cv2.Laplacian(patch, cv2.CV_64F).var()
 
 
-def measure_core_size(gray, x, y, w, h, frac=0.75, margin=10):
+def measure_core_size(gray, x, y, w, h, frac=0.35, margin=10):
     """
     Real cell size, for mean_rx/mean_ry/mean_r specifically -- NOT used for
     detection/tracking, which keeps using the full (x,y,w,h) MOG2 blob as
@@ -392,13 +392,18 @@ def measure_core_size(gray, x, y, w, h, frac=0.75, margin=10):
     FIT, not an independent measurement -- there's no ground-truth cell
     boundary in this footage, only your stated ~10um expected diameter, so
     frac was swept and the value closest to that expectation was kept. At
-    the current default (0.75), using the scale-bar-measured 2.5 um/px
-    calibration (--m_per_px), real footage gives a median core diameter of
-    ~9.85um (range 9.06-10.22um across 11 cells), with zero detections lost
-    at any fraction tested (this only ever refines size, never whether
-    something is detected at all). If --m_per_px changes, re-sweep this --
-    it was tuned against one specific px-to-um ratio, not derived from
-    anything that stays valid independent of it.
+    the current default (0.35), using the certified-bead-measured 0.93 um/px
+    calibration (--m_per_px -- see its own comment: measured against a
+    4.5um Dynabead, not the microscope's on-screen scale bar, which turned
+    out to be stale), real footage gives a median core diameter of ~10.57um
+    (range 9.14-10.86um across 11 cells), with zero detections lost at any
+    fraction tested (this only ever refines size, never whether something
+    is detected at all). Needs much less correction than before (was 0.75
+    under the old, wrong 2.5 um/px calibration) since the raw MOG2 blob is
+    already close to target once the calibration itself is fixed. If
+    --m_per_px changes, re-sweep this -- it was tuned against one specific
+    px-to-um ratio, not derived from anything that stays valid independent
+    of it.
     """
     H, W = gray.shape[:2]
     y0, y1 = max(0, y - margin), min(H, y + h + margin)
@@ -828,7 +833,7 @@ def main():
 
     ap.add_argument("--min_area",   type=float, default=12)
     ap.add_argument("--max_area",   type=float, default=8000)
-    ap.add_argument("--core_size_frac", type=float, default=0.75,
+    ap.add_argument("--core_size_frac", type=float, default=0.35,
                     help="mean_rx/mean_ry/mean_r are measured from each detected "
                          "blob's bright CORE, not its full MOG2 mask extent -- the "
                          "mask typically includes a dim halo well beyond the cell's "
@@ -841,14 +846,16 @@ def main():
                          "columns -- confirmed directly: re-running old vs. new code "
                          "on the same footage found the identical 11 tracks, same "
                          "speeds, same exit times, only mean_r changed. Default "
-                         "(0.75) is fit, not independently derived -- it's whichever "
+                         "(0.35) is fit, not independently derived -- it's whichever "
                          "value lands closest to your stated ~10um T-cell diameter, "
-                         "using --m_per_px's measured 2.5 um/px scale-bar "
-                         "calibration (re-tuned from an earlier 0.8 default that was "
-                         "fit against the prior, wrong 3.4944 um/px guess). At 0.75 "
-                         "on real footage: median diameter 9.85um (range "
-                         "9.06-10.22um across 11 cells). Re-validate against an "
-                         "independent reference (a calibration bead, or manual "
+                         "using --m_per_px's certified-bead-measured 0.93 um/px "
+                         "calibration (re-tuned from an earlier 0.75 default that "
+                         "was fit against the prior, wrong 2.5 um/px scale-bar-based "
+                         "guess -- much less correction is needed now, since the raw "
+                         "MOG2 blob is already close to target under 0.93 um/px). "
+                         "At 0.35 on real footage: median diameter 10.57um (range "
+                         "9.14-10.86um across 11 cells). Re-validate against your "
+                         "own known-size reference (a calibration bead, or manual "
                          "pixel measurement on a zoomed still frame) rather than "
                          "trusting this transfers to your own footage.")
     ap.add_argument("--max_dist",   type=float, default=220)
