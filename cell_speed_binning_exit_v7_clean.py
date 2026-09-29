@@ -425,6 +425,50 @@ def measure_core_size(gray, x, y, w, h, frac=0.35, margin=10):
     return cw, ch
 
 
+def solve_height_wall_corrected(v, shear_rate, a, h_m, max_iter=60):
+    """
+    Inverts the Faxen-type near-wall hydrodynamic correction (Goldman, Cox &
+    Brenner 1967) for height above the bottom substrate, given an observed
+    velocity:
+        V = y * shear_rate * (1 - (5/16)*(a/y)^3)      (y = height above bottom,
+                                                          valid only for y >= a)
+    Unlike the naive undisturbed-flow inversion elsewhere in this file (a plain
+    sqrt), this has no closed form in y worth hand-deriving -- V*y^2 expands to
+    a cubic in y. It IS monotonically increasing in y for y >= a though (more
+    height = less wall drag = faster, always), so plain bisection is exact and
+    robust without adding a scipy dependency for one solve.
+
+    Physically meaningful behavior this exposes that the naive model can't:
+    at y=a (a sphere in contact with the wall), V is at its hydrodynamic
+    MINIMUM, V_min = 0.6875*shear_rate*a. A velocity below that is not
+    explainable by wall drag on a freely-flowing sphere at ANY height -- there
+    is no y >= a that produces it. That's returned as NaN here, same as this
+    file's other out-of-range height case, and is worth tallying separately:
+    a track landing there wasn't just "very close to the wall", it was moving
+    slower than pure hydrodynamics allows at all, which for a non-adhesive
+    surface most likely means measurement/tracking noise on a low-confidence
+    track (e.g. a very short one) rather than real biology.
+    """
+    v_min = 0.6875 * shear_rate * a
+    if v < v_min:
+        return float("nan")
+    def f(y):
+        return y * shear_rate * (1.0 - (5.0 / 16.0) * (a / y) ** 3)
+    lo, hi = a, max(h_m, a * 2.0)
+    while f(hi) < v and hi < a * 1e6:
+        hi *= 2.0
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2.0
+        if f(mid) < v:
+            lo = mid
+        else:
+            hi = mid
+    y = (lo + hi) / 2.0
+    if y > h_m / 2.0:
+        return float("nan")  # beyond the near-wall regime this approximation is meant for
+    return y
+
+
 def detect_cells(th, frame, gray, args, fg_thresh=None, min_peak_dist=None, prominence_frac=None,
                   raw_diff=None):
     """
@@ -1265,6 +1309,8 @@ def main():
     dead_cell_counts   = defaultdict(int)
     per_rows = []
     n_height_out_of_range = [0]  # v faster than the theoretical mid-channel max -- see height calc below
+    n_wall_corrected_too_slow = [0]   # v below the hydrodynamic minimum at y=a -- see solve_height_wall_corrected
+    n_wall_corrected_too_far  = [0]   # solved y beyond h/2 -- outside the near-wall regime this model assumes
 
     # --count_at_line: a second, independent tracks-like dict scoped only to
     # detections inside the narrow band near the exit boundary (args.line_band_px).
@@ -1417,6 +1463,26 @@ def main():
                 est_height_above_bottom_um = height_m * 1e6
             else:
                 n_height_out_of_range[0] += 1
+        # Same idea as est_height_above_bottom_um above, but inverting the
+        # wall-drag-CORRECTED velocity relation instead of the naive undisturbed
+        # one -- see solve_height_wall_corrected's own docstring. This is the
+        # physically appropriate one for a genuinely near-wall cell (which is
+        # what this pipeline is built to study): the naive inversion has no
+        # floor at height=radius and will happily report an impossible height
+        # below it for any cell slowed by real wall drag, which is expected
+        # to be most of them close to the wall. Needs mean_r (already computed
+        # above) since the correction depends on the cell's own size, not just
+        # its speed.
+        est_height_wall_corrected_um = float("nan")
+        if want_height_calc:
+            shear_rate = args.shear_stress_pa / args.medium_viscosity_pa_s
+            y_m = solve_height_wall_corrected(v, shear_rate, mean_r, h_m)
+            if not math.isnan(y_m):
+                est_height_wall_corrected_um = y_m * 1e6
+            elif v < 0.6875 * shear_rate * mean_r:
+                n_wall_corrected_too_slow[0] += 1
+            else:
+                n_wall_corrected_too_far[0] += 1
         # Predicted near-wall rolling velocity, from classic Goldman-Cox-Brenner
         # hydrodynamics for a sphere translating in contact with (or very close
         # to) a wall in shear flow: hydrodynamic wall drag hinders the particle
@@ -1456,6 +1522,7 @@ def main():
                 x_exit=x_e, y_exit=y_e)
             if want_height_calc:
                 row["est_height_above_bottom_um"] = est_height_above_bottom_um
+                row["est_height_wall_corrected_um"] = est_height_wall_corrected_um
                 row["predicted_wall_velocity_m_s"] = predicted_wall_velocity_m_s
                 row["speed_to_predicted_ratio"] = speed_to_predicted_ratio
             per_rows.append(row)
@@ -1927,6 +1994,20 @@ def main():
               f"--shear_stress_pa/--chamber_height_um/--medium_viscosity_pa_s -- "
               f"est_height_above_bottom_um is NaN for those rows (no real solution "
               f"under simple parabolic flow with these parameters).")
+    if want_height_calc and n_wall_corrected_too_slow[0] > 0:
+        print(f"Note: {n_wall_corrected_too_slow[0]} counted cell(s) moved slower than "
+              f"0.6875*shear_rate*radius -- the hydrodynamic minimum velocity for a "
+              f"freely-flowing sphere in contact with the wall (y=radius) under this "
+              f"model. No height y>=radius explains a velocity that low from wall drag "
+              f"alone -- est_height_wall_corrected_um is NaN for those rows. On a "
+              f"non-adhesive surface this is most likely a low-confidence track "
+              f"(e.g. very short) rather than real biology; worth checking seen_count "
+              f"for these rows before trusting them elsewhere in the output.")
+    if want_height_calc and n_wall_corrected_too_far[0] > 0:
+        print(f"Note: {n_wall_corrected_too_far[0]} counted cell(s) solved to a height "
+              f"beyond --chamber_height_um/2 under the wall-drag-corrected model -- "
+              f"outside the near-wall regime this approximation is meant for. "
+              f"est_height_wall_corrected_um is NaN for those rows.")
     if args.verify_crossings_out:
         save_crossing_contact_sheet(args.video, per_rows, fps, args.verify_crossings_out)
 
