@@ -148,6 +148,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--video", required=True)
     ap.add_argument("--start_s", type=float, default=0.0)
+    ap.add_argument("--warmup_s", type=float, default=20.0,
+                    help="Seconds before --start_s fed to the background model only (no "
+                         "tracking), so tracking doesn't start on a cold background. See the "
+                         "comment where it's used for why this matters.")
     ap.add_argument("--end_s", type=float, default=None)
     ap.add_argument("--fps", type=float, default=None,
                     help="Exact fps, overriding everything below.")
@@ -270,9 +274,24 @@ def main():
     recent_v = deque(maxlen=200)
     v_prior = max(xcorr_peak_px, args.min_step_px)
 
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     backsub = cv2.createBackgroundSubtractorMOG2(
         history=args.mog2_history, varThreshold=args.mog2_varThreshold, detectShadows=False)
+    # Warm the background model up on the frames before start_s (no detection or
+    # tracking). Started cold, the model takes its first frame -- full of cells in a
+    # dense stretch -- as background, leaving ghost blobs everywhere: on 5_minute.mp4
+    # started cold at 30 s, only 2-15% of detected cells were tracked until ~42 s,
+    # then 64-81%, with cell density unchanged throughout.
+    warm_start = max(0, start_frame - int(args.warmup_s * fps))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, warm_start)
+    for _ in range(start_frame - warm_start):
+        ok, f = cap.read()
+        if not ok:
+            break
+        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        if args.gauss_ksize > 0:
+            k = args.gauss_ksize | 1
+            g = cv2.GaussianBlur(g, (k, k), 0)
+        backsub.apply(g, learningRate=args.learning_rate)
     vw = None
     S = max(1, args.video_scale)
     if args.out_video:
