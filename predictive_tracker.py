@@ -200,6 +200,16 @@ def main():
                          "tracking-free reference window by window, not as one global "
                          "number. 0 disables validation.")
     ap.add_argument("--out_windows_csv", default="predictive_tracks_windows.csv")
+    ap.add_argument("--frame_stride", type=int, default=1,
+                    help="Process only every Nth frame (frame numbers stay true video "
+                         "frames, so speeds stay in real units). Used as an aliasing test: "
+                         "a real cell's speed is the same at stride 1 and 2, but a track "
+                         "that hops to the next cell in a lane each processed frame gains "
+                         "(cell spacing / stride) per frame, so its speed changes with "
+                         "stride. Compare runs with compare_stride_runs.py.")
+    ap.add_argument("--out_points_csv", default=None,
+                    help="Optional: every tracked point (track_id, frame, x, y) of every "
+                         "reported track, needed to match tracks between runs.")
     ap.add_argument("--out_csv", default="predictive_tracks.csv")
     ap.add_argument("--out_video", default=None,
                     help="Optional annotated video with each track's trail.")
@@ -248,11 +258,15 @@ def main():
         ok, frame = cap.read()
         if not ok:
             break
+        if (frame_idx - start_frame) % args.frame_stride:
+            frame_idx += 1
+            continue
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if args.gauss_ksize > 0:
             k = args.gauss_ksize | 1
             gray = cv2.GaussianBlur(gray, (k, k), 0)
-        fg = backsub.apply(gray, learningRate=args.learning_rate)
+        # keep the background model's time constant in real seconds when skipping frames
+        fg = backsub.apply(gray, learningRate=min(1.0, args.learning_rate * args.frame_stride))
         _, th = cv2.threshold(fg, args.mask_thresh, 255, cv2.THRESH_BINARY)
         if args.close_iter > 0:
             th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=args.close_iter)
@@ -378,6 +392,9 @@ def main():
         ))
     df = pd.DataFrame(rows)
     df.to_csv(args.out_csv, index=False)
+    if args.out_points_csv:
+        pd.DataFrame([dict(track_id=t, frame=p[0], x=p[3], y=p[4])
+                      for t, st in finished for p in st["pts"]]).to_csv(args.out_points_csv, index=False)
     print(f"Wrote: {args.out_csv}  ({len(df)} confirmed tracks)")
     if not len(df):
         return
