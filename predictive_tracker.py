@@ -167,6 +167,19 @@ def main():
     ap.add_argument("--learning_rate", type=float, default=0.0005)
     ap.add_argument("--gauss_ksize", type=int, default=3)
     ap.add_argument("--close_iter", type=int, default=1)
+    ap.add_argument("--min_diameter_um", type=float, default=5.0,
+                    help="Size limit, applied twice. (1) Detections smaller than this "
+                         "diameter are ignored before tracking, as "
+                         "the earlier paper's TrafficFlowAnalysis tracker does (it keeps a "
+                         "contour only if its minimum enclosing circle is larger than the "
+                         "minimum object diameter; the paper used >5 um). Diameter here is "
+                         "the detection's bounding-box long side, which equals the enclosing "
+                         "circle's diameter for a round blob. Blobs include each cell's bright "
+                         "halo, so this removes very little (~0.1-0.6%% on 5_minute.mp4). (2) "
+                         "Tracks whose measured cell (core) diameter, 2 x mean_r_um, is below "
+                         "this get below_min_diameter=1 -- 2-8.5%% of moving tracks on "
+                         "5_minute.mp4, and slower than the rest (debris, fragments); exclude "
+                         "them from speed/height analysis. 0 disables both.")
     ap.add_argument("--min_area", type=float, default=12)
     ap.add_argument("--max_area", type=float, default=8000)
     ap.add_argument("--use_watershed_split", action="store_true")
@@ -299,6 +312,7 @@ def main():
                              args.video_fps or file_fps / 2.0, (W * S, H * S))
 
     tracks, finished = {}, []
+    n_det_all = n_det_kept = 0
     next_id, frame_idx = 1, start_frame
     # along-flow coordinate of the exit edge, and the frame's extent along the flow
     fa_limit = {"down": H, "right": W, "up": 0, "left": 0}[args.flow_dir]
@@ -324,6 +338,12 @@ def main():
         if args.close_iter > 0:
             th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=args.close_iter)
         _, detections, det_boxes = detect_cells(th, frame, gray, det_args)
+        n_det_all += len(detections)
+        if args.min_diameter_um > 0:
+            keep = [i for i, b in enumerate(det_boxes) if max(b[2], b[3]) * um_per_px >= args.min_diameter_um]
+            detections = [detections[i] for i in keep]
+            det_boxes = [det_boxes[i] for i in keep]
+        n_det_kept += len(detections)
 
         def point(j):
             bx, by, bw, bh = det_boxes[j][:4]
@@ -465,6 +485,7 @@ def main():
             fit_resid_px=float(np.sqrt(np.mean(resid ** 2))),
             backward_steps=int((step < 0).sum()),
             mean_r_um=float(np.mean([p[5] for p in st["pts"]])) * um_per_px,
+            below_min_diameter=int(2 * float(np.mean([p[5] for p in st["pts"]])) * um_per_px < args.min_diameter_um),
             speed_reliable=int(slope * um_per_px * fps <= args.max_reliable_um_s),
             is_stationary=int(slope * um_per_px * fps < args.min_moving_um_s),
         ))
@@ -484,6 +505,9 @@ def main():
         pd.DataFrame([dict(track_id=t, frame=p[0], x=p[3], y=p[4])
                       for t, st in finished for p in st["pts"]]).to_csv(args.out_points_csv, index=False)
     print(f"Wrote: {args.out_csv}  ({len(df)} confirmed tracks)")
+    if args.min_diameter_um > 0 and n_det_all:
+        print(f"  detections smaller than {args.min_diameter_um:g} um removed before tracking: "
+              f"{n_det_all - n_det_kept} of {n_det_all} ({100 * (n_det_all - n_det_kept) / n_det_all:.1f}%)")
     if not len(df):
         return
 
@@ -495,8 +519,11 @@ def main():
     print(f"  track length, median    : {df.n_points.median():.0f} points; tracks spanning "
           f">=75% of the frame: {(df.along_flow_um >= 0.75 * flow_extent * um_per_px).sum()}")
 
+    if args.min_diameter_um > 0:
+        print(f"  tracks with measured cell diameter < {args.min_diameter_um:g} um (below_min_diameter=1): "
+              f"{100 * df.below_min_diameter.mean():.1f}%")
     if want_height:
-        mv = df[(df.speed_reliable == 1) & (df.is_stationary == 0)]
+        mv = df[(df.speed_reliable == 1) & (df.is_stationary == 0) & (df.below_min_diameter == 0)]
         if len(mv):
             print(f"  moving, reliably tracked: {len(mv)}; in contact with substrate "
                   f"(naive height <= {args.contact_radius_factor}x radius): {100 * mv.in_contact.mean():.0f}%")
