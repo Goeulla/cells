@@ -139,6 +139,15 @@ def main():
                          "clutter. Does not affect the recorded path used for the "
                          "summary CSV, only what's drawn.")
     ap.add_argument("--out_summary_csv", type=str, default="track_paths_summary.csv")
+    ap.add_argument("--enable_stall_fix", action="store_true",
+                    help="Apply the same stall-detection fix now in "
+                         "cell_speed_binning_exit_v7_clean.py (--stall_window/--stall_px "
+                         "there): drop a track that hasn't moved more than --stall_px in "
+                         "--stall_window seconds, instead of letting it keep matching a "
+                         "static object forever. Off by default so this tool still shows "
+                         "you raw, unfixed tracker behavior when you want to see it -- "
+                         "pass this to see the fixed behavior instead, e.g. for a direct "
+                         "before/after comparison.")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -161,6 +170,7 @@ def main():
     tracks = {}      # tid -> {"cx","cy","missed_count","path":[(frame,cx,cy),...]}
     next_id = 1
     cur_frame = start_frame
+    stall_frames = max(1, round(args.stall_window_frames))
 
     while True:
         if end_frame_excl is not None and cur_frame >= end_frame_excl:
@@ -197,12 +207,22 @@ def main():
             st["missed_count"] = 0
             st["updated"] = True
             st["path"].append((cur_frame, cx, cy))
+            if args.enable_stall_fix:
+                if math.hypot(cx - st["stall_x"], cy - st["stall_y"]) > args.stall_px:
+                    st["stall_x"], st["stall_y"], st["stall_frame"] = cx, cy, cur_frame
+                elif cur_frame - st["stall_frame"] >= stall_frames:
+                    st["stalled"] = True
 
         for j in unmatched:
             cx, cy, *_ = detections[j]
             tracks[next_id] = dict(cx=cx, cy=cy, missed_count=0, updated=True,
-                                    path=[(cur_frame, cx, cy)])
+                                    path=[(cur_frame, cx, cy)],
+                                    stall_x=cx, stall_y=cy, stall_frame=cur_frame, stalled=False)
             next_id += 1
+
+        if args.enable_stall_fix:
+            for tid in [tid for tid, st in tracks.items() if st.get("stalled")]:
+                del tracks[tid]
 
         # Draw current frame with every live track's trail so far.
         vis = frame.copy()
