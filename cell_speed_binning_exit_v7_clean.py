@@ -940,43 +940,8 @@ def main():
                          "own known-size reference (a calibration bead, or manual "
                          "pixel measurement on a zoomed still frame) rather than "
                          "trusting this transfers to your own footage.")
-    # Same reasoning and same finding as --line_max_dist (see its own help): only
-    # legitimate frame-to-frame cell movement needs to fit within this radius, and
-    # measured speeds up to ~400px/s at a ~0.245s processed-frame gap is at most
-    # ~98px of real displacement -- 220 (the old default here) is nearly 2.5x
-    # looser than that, and confirmed directly (via verify_track_paths.py, a
-    # separate visualization tool) to let this full-frame tracker's tracks jump
-    # onto unrelated objects and wander erratically across the whole frame instead
-    # of following one real cell -- drawn trails looked like chaotic zigzags
-    # covering the entire frame, and 30/30 tracks in a 15s test clip never
-    # naturally terminated (a hallmark of a track stuck self-matching a static
-    # object forever). See also --stall_window/--stall_px below, added for the
-    # same reason --line_stall_window was: tightening this distance alone doesn't
-    # stop absorption of a completely static object sitting a normal, small
-    # distance away.
-    ap.add_argument("--max_dist",   type=float, default=110,
-                    help="Matching radius for a NOT-YET-counted track (see --dedup_dist "
-                         "for the separate, much tighter radius used to reclaim an "
-                         "already-counted lingering one). See comment above for why this "
-                         "is 110, not the old 220.")
+    ap.add_argument("--max_dist",   type=float, default=220)
     ap.add_argument("--max_missed", type=int,   default=20)
-    ap.add_argument("--stall_window", type=float, default=1.0,
-                    help="If a not-yet-counted track hasn't moved more than --stall_px "
-                         "from where it was --stall_window seconds ago, it's dropped "
-                         "(not counted) rather than left to keep accumulating seen_count "
-                         "forever. Same fix, same reason, as --count_at_line's "
-                         "--line_stall_window: --max_dist alone can't stop a real cell's "
-                         "track from being absorbed by a completely static object (dust, "
-                         "debris, an out-of-focus artifact) sitting a normal, small "
-                         "distance away -- confirmed directly (via verify_track_paths.py) "
-                         "that this happens in the full-frame tracker too, not just the "
-                         "exit-band one.")
-    ap.add_argument("--stall_px", type=float, default=3.0,
-                    help="Max px of movement over --stall_window to still count as "
-                         "genuine progress rather than a stall -- see --stall_window. "
-                         "Kept small on purpose: normal per-frame detection jitter is a "
-                         "pixel or two, so this only screens out something truly not "
-                         "moving, not a slow-but-real cell.")
     ap.add_argument("--min_mean_intensity", type=float, default=0.0,
                     help="Minimum mean grayscale intensity (0-255) inside a detected blob "
                          "for it to be counted as a cell. Blobs darker than this ('black' "
@@ -1442,7 +1407,6 @@ def main():
 
     next_id  = 1
     tracks   = {}
-    stall_frames = max(1, round(args.stall_window * fps / max(1, args.frame_stride)))
     recent_streaks = deque()
     recent_exits   = deque()
     counts             = defaultdict(int)
@@ -1837,15 +1801,6 @@ def main():
                 st["end_x"], st["end_y"] = cx, cy
                 st["sum_rx"] += cw / 2.0
                 st["sum_ry"] += ch / 2.0
-                # Stall detection -- see --stall_window's help for why this exists
-                # (--max_dist alone doesn't stop absorption by a static object sitting a
-                # normal small distance away; confirmed via verify_track_paths.py). Anchor
-                # resets on real progress; if still within --stall_px of it after
-                # --stall_window seconds, flag for the cleanup pass below to drop it.
-                if math.hypot(cx - st["stall_x"], cy - st["stall_y"]) > args.stall_px:
-                    st["stall_x"], st["stall_y"], st["stall_frame"] = cx, cy, cur_frame
-                elif cur_frame - st["stall_frame"] >= stall_frames:
-                    st["stalled"] = True
 
             for j in unmatched:
                 cx, cy, is_streak, is_dead = detections[j]
@@ -1864,15 +1819,8 @@ def main():
                     seen_count=1, missed_count=0, is_streak=bool(is_streak),
                     dead_count=1 if is_dead else 0, counted=False,
                     updated=True, start_x=cx, start_y=cy, end_x=cx, end_y=cy,
-                    sum_rx=cw / 2.0, sum_ry=ch / 2.0,
-                    stall_x=cx, stall_y=cy, stall_frame=cur_frame, stalled=False)
+                    sum_rx=cw / 2.0, sum_ry=ch / 2.0)
                 next_id += 1
-
-            # A track that never made genuine progress isn't a real crossing -- drop it
-            # before it ever gets a chance to match crossed_exit() below. Same fix, same
-            # reason, as the --count_at_line line_tracks path above.
-            for tid in [tid for tid, st in tracks.items() if st.get("stalled") and not st["counted"]]:
-                del tracks[tid]
 
             # Mark counted rather than deleting on crossing -- a cell that lingers in
             # the exit margin for many frames (e.g. a real, slow adhesion-interacting
