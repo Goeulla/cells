@@ -65,6 +65,77 @@ def track_color(tid):
     return (int(b * 255), int(g * 255), int(r * 255))
 
 
+FLOW_VEC = {"down": (0, 1), "up": (0, -1), "right": (1, 0), "left": (-1, 0)}
+
+
+def along_across(dx, dy, flow_dir):
+    """Split a displacement into its component along the flow direction and across it."""
+    fx, fy = FLOW_VEC[flow_dir]
+    return dx * fx + dy * fy, dx * (-fy) + dy * fx
+
+
+def overlap_match(tracks, detections, det_boxes, args):
+    """
+    Adaptation of TrafficFlowAnalysis's MovingObject.match_overlap +
+    ObjectDatabase stitching (github.com/telescope7/TrafficFlowAnalysis), rotated to
+    this project's flow direction. Two stages:
+
+    1. Overlap: a detection can continue a track only if it hasn't moved backward
+       against the flow by more than --overlap_backtrack_px (their `cx > lf.cx + 6`)
+       AND its bounding box intersects the track's last bounding box.
+    2. Lane stitch: a detection still unmatched can continue a track not matched this
+       frame if it's within --lane_px across the flow of the track's last position and
+       0 < forward distance <= --lane_max_gap_px (their `lost_y +/- 5`, `new_x < lost_x`,
+       `closest_mc_dist = 500`); closest forward wins.
+
+    Deliberate deviations from the original, which would otherwise not be comparable to
+    one-to-one tracking: assignment is one-to-one (theirs lets one contour extend
+    several tracks and dedups at export), and the lane uses the track's last position
+    (theirs uses the average over its whole life, which lags a drifting cell).
+    """
+    tids = list(tracks.keys())
+    n_d = len(detections)
+    if not tids or n_d == 0:
+        return [], set(range(n_d))
+
+    tc = np.array([[tracks[t]["cx"], tracks[t]["cy"]] for t in tids], dtype=np.float64)
+    tb = np.array([tracks[t]["box"] for t in tids], dtype=np.float64)
+    dc = np.array([[d[0], d[1]] for d in detections], dtype=np.float64)
+    db = np.array([b[:4] for b in det_boxes], dtype=np.float64)
+
+    dx = dc[None, :, 0] - tc[:, None, 0]
+    dy = dc[None, :, 1] - tc[:, None, 1]
+    along, across = along_across(dx, dy, args.flow_dir)
+    dist = np.hypot(dx, dy)
+
+    ix = (tb[:, None, 0] <= db[None, :, 0] + db[None, :, 2]) & (db[None, :, 0] <= tb[:, None, 0] + tb[:, None, 2])
+    iy = (tb[:, None, 1] <= db[None, :, 1] + db[None, :, 3]) & (db[None, :, 1] <= tb[:, None, 1] + tb[:, None, 3])
+    ok = (along >= -args.overlap_backtrack_px) & ix & iy
+
+    pairs, used_t, used_d = [], set(), set()
+    ii, jj = np.nonzero(ok)
+    for k in np.argsort(dist[ii, jj], kind="stable"):
+        i, j = ii[k], jj[k]
+        if i in used_t or j in used_d:
+            continue
+        pairs.append((tids[i], j))
+        used_t.add(i)
+        used_d.add(j)
+
+    lane_ok = (np.abs(across) < args.lane_px) & (along > 0) & (along <= args.lane_max_gap_px)
+    det_along_abs = along_across(dc[:, 0], dc[:, 1], args.flow_dir)[0]
+    for j in sorted(set(range(n_d)) - used_d, key=lambda j: -det_along_abs[j]):
+        cand = [i for i in np.nonzero(lane_ok[:, j])[0] if i not in used_t]
+        if not cand:
+            continue
+        i = min(cand, key=lambda i: along[i, j])
+        pairs.append((tids[i], j))
+        used_t.add(i)
+        used_d.add(j)
+
+    return pairs, set(range(n_d)) - used_d
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--video", required=True)
@@ -118,6 +189,23 @@ def main():
                          "production setting actually does, not a hypothetical improved "
                          "one.")
     ap.add_argument("--max_missed", type=int, default=20)
+    ap.add_argument("--matcher", choices=["distance", "overlap"], default="distance",
+                    help="distance: Hungarian nearest-centroid within --max_dist (what "
+                         "cell_speed_binning_exit_v7_clean.py uses). overlap: adapted "
+                         "TrafficFlowAnalysis matching -- see overlap_match().")
+    ap.add_argument("--flow_dir", choices=list(FLOW_VEC), default="down",
+                    help="Direction cells flow in the image. Used by --matcher overlap and "
+                         "by the along-flow summary columns.")
+    ap.add_argument("--overlap_backtrack_px", type=float, default=6.0,
+                    help="--matcher overlap: max px a detection may sit BEHIND a track's "
+                         "last position (against the flow) and still continue it.")
+    ap.add_argument("--lane_px", type=float, default=5.0,
+                    help="--matcher overlap: max px across the flow for lane stitching.")
+    ap.add_argument("--lane_max_gap_px", type=float, default=500.0,
+                    help="--matcher overlap: max px forward for lane stitching.")
+    ap.add_argument("--overlap_max_missed", type=int, default=7,
+                    help="--matcher overlap: frames a track survives unmatched (their "
+                         "`buffer = 7`). --max_missed applies to --matcher distance only.")
     ap.add_argument("--min_track_len", type=int, default=5,
                     help="Drop tracks shorter than this many frames from BOTH outputs -- "
                          "single-frame noise blips aren't useful to visualize or flag.")
@@ -165,10 +253,12 @@ def main():
     backsub = cv2.createBackgroundSubtractorMOG2(
         history=args.mog2_history, varThreshold=args.mog2_varThreshold, detectShadows=False)
 
-    tracks = {}      # tid -> {"cx","cy","missed_count","path":[(frame,cx,cy),...]}
+    tracks = {}      # tid -> {"cx","cy","box","missed_count","path":[(frame,cx,cy),...]}
+    finished = []    # every track that ended, however it ended -- not just ones alive at the end
     next_id = 1
     cur_frame = start_frame
     stall_frames = max(1, round(args.stall_window_frames))
+    max_missed = args.overlap_max_missed if args.matcher == "overlap" else args.max_missed
 
     while True:
         if end_frame_excl is not None and cur_frame >= end_frame_excl:
@@ -197,11 +287,15 @@ def main():
         for st in tracks.values():
             st["updated"] = False
 
-        pairs, unmatched = hungarian_match(tracks, detections, args.max_dist)
+        if args.matcher == "overlap":
+            pairs, unmatched = overlap_match(tracks, detections, det_boxes, args)
+        else:
+            pairs, unmatched = hungarian_match(tracks, detections, args.max_dist)
         for tid, j in pairs:
             cx, cy, *_ = detections[j]
             st = tracks[tid]
             st["cx"], st["cy"] = cx, cy
+            st["box"] = det_boxes[j][:4]
             st["missed_count"] = 0
             st["updated"] = True
             st["path"].append((cur_frame, cx, cy))
@@ -213,14 +307,15 @@ def main():
 
         for j in unmatched:
             cx, cy, *_ = detections[j]
-            tracks[next_id] = dict(cx=cx, cy=cy, missed_count=0, updated=True,
+            tracks[next_id] = dict(cx=cx, cy=cy, box=det_boxes[j][:4], missed_count=0, updated=True,
                                     path=[(cur_frame, cx, cy)],
                                     stall_x=cx, stall_y=cy, stall_frame=cur_frame, stalled=False)
             next_id += 1
 
         if args.enable_stall_fix:
             for tid in [tid for tid, st in tracks.items() if st.get("stalled")]:
-                del tracks[tid]
+                tracks[tid]["end_reason"] = "stalled"
+                finished.append(tracks.pop(tid))
 
         # Draw current frame with every live track's trail so far.
         vis = frame.copy()
@@ -244,8 +339,9 @@ def main():
             st = tracks[tid]
             if not st["updated"]:
                 st["missed_count"] += 1
-                if st["missed_count"] > args.max_missed:
-                    del tracks[tid]
+                if st["missed_count"] > max_missed:
+                    st["end_reason"] = "missed"
+                    finished.append(tracks.pop(tid))
 
         cur_frame += 1
 
@@ -253,8 +349,9 @@ def main():
     vw.release()
     print(f"Wrote: {args.out_video}")
 
-    # Any track still alive at the end of the loop needs closing out for the summary too.
-    finished = list(tracks.values())
+    for st in tracks.values():
+        st["end_reason"] = "alive_at_end"
+        finished.append(st)
 
     rows = []
     for st in finished:
@@ -268,6 +365,11 @@ def main():
         net_disp = math.hypot(xs[-1] - xs[0], ys[-1] - ys[0])
         straightness = (net_disp / total_len) if total_len > 0 else float("nan")
         max_jump = max((math.hypot(xs[i] - xs[i-1], ys[i] - ys[i-1]) for i in range(1, len(path))), default=0.0)
+        along_net, across_net = along_across(xs[-1] - xs[0], ys[-1] - ys[0], args.flow_dir)
+        steps_along = [along_across(xs[i] - xs[i-1], ys[i] - ys[i-1], args.flow_dir)[0]
+                       for i in range(1, len(path))]
+        backward_step_frac = (sum(1 for s in steps_along if s < -2.0) / len(steps_along)) if steps_along else float("nan")
+        duration_s = (frames[-1] - frames[0]) / fps
 
         # Longest run where movement over --stall_window_frames stayed within --stall_px.
         max_stall = 0
@@ -289,7 +391,11 @@ def main():
 
         rows.append(dict(
             first_frame=frames[0], last_frame=frames[-1], n_points=len(path),
+            end_reason=st["end_reason"], duration_s=duration_s,
             total_path_length=total_len * scale_um, net_displacement=net_disp * scale_um,
+            along_flow_net=along_net * scale_um, across_flow_net=across_net * scale_um,
+            speed_along_flow=(along_net * scale_um / duration_s) if duration_s > 0 else float("nan"),
+            backward_step_frac=backward_step_frac,
             straightness=straightness, max_single_frame_jump=max_jump * scale_um,
             max_stall_frames=max_stall, distance_unit=unit,
             start_x=xs[0], start_y=ys[0], end_x=xs[-1], end_y=ys[-1],
