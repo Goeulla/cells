@@ -50,7 +50,7 @@ try:
 except ImportError:
     linear_sum_assignment = None
 
-from cell_speed_binning_exit_v7_clean import detect_cells
+from cell_speed_binning_exit_v7_clean import detect_cells, measure_core_size, solve_height_wall_corrected
 
 FLOW_VEC = {"down": (0, 1), "up": (0, -1), "right": (1, 0), "left": (-1, 0)}
 
@@ -193,6 +193,29 @@ def main():
     ap.add_argument("--prior_frames", type=int, default=150,
                     help="Frames used for the tracking-free speed prior / reference.")
 
+    ap.add_argument("--max_reliable_um_s", type=float, default=800.0,
+                    help="Tracks faster than this get speed_reliable=0. Default from the "
+                         "stride test on 5_minute.mp4 (compare_stride_runs.py): step "
+                         "agreement 77-98%% up to 800 um/s, ~50%% above -- above this, "
+                         "cells move farther per frame than the spacing between cells.")
+    ap.add_argument("--min_moving_um_s", type=float, default=20.0,
+                    help="Tracks slower than this get is_stationary=1: cells sitting on the "
+                         "surface or debris, tracked from detection jitter. Not free-flowing "
+                         "cells -- exclude them from velocity/height analysis (on 5_minute.mp4, "
+                         "40-60 s: ~9%% of tracks). Shown in gray in --out_video.")
+    ap.add_argument("--core_size_frac", type=float, default=0.35,
+                    help="Cell size from each detection's bright core (same method and "
+                         "default as the counting scripts' mean_r).")
+    ap.add_argument("--shear_stress_pa", type=float, default=None)
+    ap.add_argument("--chamber_height_um", type=float, default=None)
+    ap.add_argument("--medium_viscosity_pa_s", type=float, default=None,
+                    help="Set all three to add height estimates per track (same two models "
+                         "as the counting scripts).")
+    ap.add_argument("--video_scale", type=int, default=2,
+                    help="--out_video is upscaled by this factor so labels are readable.")
+    ap.add_argument("--video_fps", type=float, default=None,
+                    help="Playback fps of --out_video (default: half the source fps, "
+                         "i.e. slow motion, so individual cells can be followed by eye).")
     ap.add_argument("--validate_window", type=int, default=150,
                     help="Frames per validation window. Flow speed changes during a "
                          "recording (measured on 5_minute.mp4: from 0 to ~46 px/frame "
@@ -243,8 +266,10 @@ def main():
     backsub = cv2.createBackgroundSubtractorMOG2(
         history=args.mog2_history, varThreshold=args.mog2_varThreshold, detectShadows=False)
     vw = None
+    S = max(1, args.video_scale)
     if args.out_video:
-        vw = cv2.VideoWriter(args.out_video, cv2.VideoWriter_fourcc(*"mp4v"), file_fps, (W, H))
+        vw = cv2.VideoWriter(args.out_video, cv2.VideoWriter_fourcc(*"mp4v"),
+                             args.video_fps or file_fps / 2.0, (W * S, H * S))
 
     tracks, finished = {}, []
     next_id, frame_idx = 1, start_frame
@@ -262,6 +287,7 @@ def main():
             frame_idx += 1
             continue
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_sharp = gray  # unblurred, for cell-size measurement
         if args.gauss_ksize > 0:
             k = args.gauss_ksize | 1
             gray = cv2.GaussianBlur(gray, (k, k), 0)
@@ -270,7 +296,12 @@ def main():
         _, th = cv2.threshold(fg, args.mask_thresh, 255, cv2.THRESH_BINARY)
         if args.close_iter > 0:
             th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=args.close_iter)
-        _, detections, _ = detect_cells(th, frame, gray, det_args)
+        _, detections, det_boxes = detect_cells(th, frame, gray, det_args)
+
+        def point(j):
+            bx, by, bw, bh = det_boxes[j][:4]
+            cw, ch = measure_core_size(gray_sharp, bx, by, bw, bh, args.core_size_frac)
+            return (frame_idx, D[j, 0], D[j, 1], detections[j][0], detections[j][1], (cw + ch) / 4.0)
 
         D = np.array([to_flow(d[0], d[1], args.flow_dir) for d in detections], dtype=np.float64).reshape(-1, 2)
         free = set(range(len(D)))
@@ -294,7 +325,7 @@ def main():
             for r, c in assign(cost, gate=1.0):
                 j = cols[c]
                 st = tracks[est[r]]
-                st["pts"].append((frame_idx, D[j, 0], D[j, 1], detections[j][0], detections[j][1]))
+                st["pts"].append(point(j))
                 st["v"] = track_velocity([(p[0], p[1], p[2]) for p in st["pts"]], args.vel_window)
                 st["missed"] = 0
                 free.discard(j)
@@ -318,13 +349,13 @@ def main():
                     continue
                 j = cols[c]
                 st = tracks[new[r]]
-                st["pts"].append((frame_idx, D[j, 0], D[j, 1], detections[j][0], detections[j][1]))
+                st["pts"].append(point(j))
                 st["v"] = track_velocity([(p[0], p[1], p[2]) for p in st["pts"]], args.vel_window)
                 st["missed"] = 0
                 free.discard(j)
 
         for j in free:
-            tracks[next_id] = dict(pts=[(frame_idx, D[j, 0], D[j, 1], detections[j][0], detections[j][1])],
+            tracks[next_id] = dict(pts=[point(j)],
                                    v=(0.0, 0.0), missed=0)
             next_id += 1
 
@@ -345,17 +376,32 @@ def main():
                     v_prior = max(float(np.median(recent_v)), args.min_step_px)
 
         if vw is not None:
-            vis = frame.copy()
+            # Only tracks matched on THIS frame are drawn, so every circle sits on a
+            # detection the tracker actually used -- nothing is drawn from prediction.
+            vis = cv2.resize(frame, (W * S, H * S), interpolation=cv2.INTER_NEAREST)
             for t, st in tracks.items():
-                if len(st["pts"]) < 2:
+                if len(st["pts"]) < 3 or st["pts"][-1][0] != frame_idx:
                     continue
-                hue = (t * 0.618033988749895) % 1.0
-                color = tuple(int(255 * v) for v in cv2.cvtColor(
-                    np.uint8([[[int(hue * 179), 220, 255]]]), cv2.COLOR_HSV2BGR)[0, 0] / 255.0)
-                xy = [(int(p[3]), int(p[4])) for p in st["pts"][-60:]]
+                hue = int((t * 0.618033988749895) % 1.0 * 179)
+                color = tuple(int(c) for c in cv2.cvtColor(np.uint8([[[hue, 230, 255]]]), cv2.COLOR_HSV2BGR)[0, 0])
+                xy = [(int(p[3] * S), int(p[4] * S)) for p in st["pts"][-40:]]
                 for p0, p1 in zip(xy, xy[1:]):
-                    cv2.line(vis, p0, p1, color, 1)
-                cv2.circle(vis, xy[-1], 4, color, 1)
+                    cv2.line(vis, p0, p1, color, 1, cv2.LINE_AA)
+                for q in xy[:-1]:
+                    cv2.circle(vis, q, 1, color, -1)
+                speed = st["v"][0] * um_per_px * fps
+                reliable = speed <= args.max_reliable_um_s
+                if speed < args.min_moving_um_s:
+                    color = (150, 150, 150)
+                cv2.circle(vis, xy[-1], int(max(4, st["pts"][-1][5]) * S) + 2,
+                           color if reliable else (0, 0, 255), 1 if reliable else 2, cv2.LINE_AA)
+                cv2.putText(vis, f"{t}:{speed:.0f}" + ("" if reliable else "?"),
+                            (xy[-1][0] + 8 * S // 2 + 4, xy[-1][1] + 4), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.33 * S, color if reliable else (0, 0, 255), 1, cv2.LINE_AA)
+            cv2.rectangle(vis, (0, 0), (W * S, 18 * S // 2 + 6), (0, 0, 0), -1)
+            cv2.putText(vis, f"t={frame_idx / fps:6.2f}s  label = track:speed(um/s)   "
+                             f"red ? = >{args.max_reliable_um_s:.0f} um/s (unreliable)   gray = stationary",
+                        (6, 9 * S // 2 + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.3 * S, (255, 255, 255), 1, cv2.LINE_AA)
             vw.write(vis)
 
         frame_idx += 1
@@ -368,6 +414,8 @@ def main():
         if len(st["pts"]) >= args.min_confirm:
             finished.append((t, st))
 
+    height_params = (args.shear_stress_pa, args.chamber_height_um, args.medium_viscosity_pa_s)
+    want_height = all(x is not None for x in height_params)
     rows, steps, step_frames = [], [], []
     for t, st in finished:
         f = np.array([p[0] for p in st["pts"]], dtype=np.float64)
@@ -389,7 +437,18 @@ def main():
             speed_step_cv=float(np.std(step) / np.mean(step)) if np.mean(step) > 0 else float("nan"),
             fit_resid_px=float(np.sqrt(np.mean(resid ** 2))),
             backward_steps=int((step < 0).sum()),
+            mean_r_um=float(np.mean([p[5] for p in st["pts"]])) * um_per_px,
+            speed_reliable=int(slope * um_per_px * fps <= args.max_reliable_um_s),
+            is_stationary=int(slope * um_per_px * fps < args.min_moving_um_s),
         ))
+        if want_height:
+            v = slope * um_per_px * fps * 1e-6          # m/s
+            r_m = rows[-1]["mean_r_um"] * 1e-6
+            h_m = args.chamber_height_um * 1e-6
+            disc = h_m ** 2 / 4.0 - v * h_m * args.medium_viscosity_pa_s / args.shear_stress_pa
+            rows[-1]["est_height_naive_um"] = (h_m / 2.0 - math.sqrt(disc)) * 1e6 if disc >= 0 and v > 0 else float("nan")
+            y = solve_height_wall_corrected(v, args.shear_stress_pa / args.medium_viscosity_pa_s, r_m, h_m) if v > 0 else float("nan")
+            rows[-1]["est_height_wall_corrected_um"] = y * 1e6 if np.isfinite(y) else float("nan")
     df = pd.DataFrame(rows)
     df.to_csv(args.out_csv, index=False)
     if args.out_points_csv:
