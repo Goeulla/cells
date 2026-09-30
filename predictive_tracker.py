@@ -206,6 +206,14 @@ def main():
     ap.add_argument("--core_size_frac", type=float, default=0.35,
                     help="Cell size from each detection's bright core (same method and "
                          "default as the counting scripts' mean_r).")
+    ap.add_argument("--contact_radius_factor", type=float, default=1.8,
+                    help="in_contact=1 when est_height_naive_um <= this x mean_r_um. 1.8 is "
+                         "Oh et al. 2015 (J Cell Sci 128:3731), who use the same naive height "
+                         "equation (their Eqn 3, wall effects neglected) and count a cell as "
+                         "in contact with the substrate when its calculated height is within "
+                         "1.8x the cell radius. Because that equation ignores wall drag, a cell "
+                         "touching the substrate typically gets a height BELOW its own radius "
+                         "-- that is the signature of contact, not an error.")
     ap.add_argument("--shear_stress_pa", type=float, default=None)
     ap.add_argument("--chamber_height_um", type=float, default=None)
     ap.add_argument("--medium_viscosity_pa_s", type=float, default=None,
@@ -449,6 +457,8 @@ def main():
             rows[-1]["est_height_naive_um"] = (h_m / 2.0 - math.sqrt(disc)) * 1e6 if disc >= 0 and v > 0 else float("nan")
             y = solve_height_wall_corrected(v, args.shear_stress_pa / args.medium_viscosity_pa_s, r_m, h_m) if v > 0 else float("nan")
             rows[-1]["est_height_wall_corrected_um"] = y * 1e6 if np.isfinite(y) else float("nan")
+            hn = rows[-1]["est_height_naive_um"]
+            rows[-1]["in_contact"] = int(np.isfinite(hn) and hn <= args.contact_radius_factor * rows[-1]["mean_r_um"])
     df = pd.DataFrame(rows)
     df.to_csv(args.out_csv, index=False)
     if args.out_points_csv:
@@ -465,6 +475,12 @@ def main():
     print(f"  backward steps          : {100 * (steps < 0).mean():.1f}% of all steps")
     print(f"  track length, median    : {df.n_points.median():.0f} points; tracks spanning "
           f">=75% of the frame: {(df.along_flow_um >= 0.75 * flow_extent * um_per_px).sum()}")
+
+    if want_height:
+        mv = df[(df.speed_reliable == 1) & (df.is_stationary == 0)]
+        if len(mv):
+            print(f"  moving, reliably tracked: {len(mv)}; in contact with substrate "
+                  f"(naive height <= {args.contact_radius_factor}x radius): {100 * mv.in_contact.mean():.0f}%")
 
     if args.validate_window <= 0:
         return
