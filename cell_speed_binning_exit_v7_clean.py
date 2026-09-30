@@ -1174,18 +1174,57 @@ def main():
     ap.add_argument("--line_dedup_dist", type=float, default=10,
                     help="--count_at_line: max px between two in-band sightings for them to be "
                          "treated as the same crossing cell rather than two different cells. "
-                         "This is the ONLY matching radius for line_tracks (unlike the full-frame "
-                         "tracker, which uses a separate, much tighter radius just for reclaiming "
-                         "an already-counted lingering cell) -- it has to be tight enough that two "
-                         "genuinely different, simultaneously-present cells in the band don't get "
-                         "matched to the same track (silently dropping one of them), which becomes "
-                         "a real risk in dense footage: confirmed directly that at ~22px average "
-                         "in-band spacing, the old default of 25 (inherited from the full-frame "
-                         "tracker's --dedup_dist, never separately tuned for the narrower band) "
-                         "undercounted a dense region by more than half relative to a sparser one "
-                         "with the same measured band density ratio -- lowering it to 10 recovered "
-                         "most of that gap without fragmenting a real, independently-verified slow "
-                         "(~3px/s) lingering cell.")
+                         "This is the matching radius ONLY for reclaiming an already-counted, "
+                         "still-lingering line_track (see --line_max_dist for the separate, "
+                         "looser radius used before a track is first counted) -- it has to be "
+                         "tight enough that two genuinely different, simultaneously-present cells "
+                         "in the band don't get matched to the same track (silently dropping one "
+                         "of them), which becomes a real risk in dense footage: confirmed directly "
+                         "that at ~22px average in-band spacing, the old default of 25 (inherited "
+                         "from the full-frame tracker's --dedup_dist, never separately tuned for "
+                         "the narrower band) undercounted a dense region by more than half relative "
+                         "to a sparser one with the same measured band density ratio -- lowering it "
+                         "to 10 recovered most of that gap without fragmenting a real, "
+                         "independently-verified slow (~3px/s) lingering cell.")
+    ap.add_argument("--line_max_dist", type=float, default=110,
+                    help="--count_at_line: matching radius for a NOT-YET-counted line_track "
+                         "(see --line_dedup_dist for the separate, tighter radius used to reclaim "
+                         "an already-counted one). Needs to be generous enough to bridge real "
+                         "fast-cell frame-to-frame movement -- measured speeds up to ~400px/s here, "
+                         "which at a ~0.245s processed-frame gap is up to ~98px of real "
+                         "displacement -- but this used to just reuse --max_dist (220, sized for "
+                         "matching ANYWHERE in the whole frame), which is far looser than that "
+                         "~98px figure actually requires. Confirmed directly on real footage: that "
+                         "looseness let an uncounted track jump 150-190px in a single frame onto a "
+                         "completely unrelated object, corrupting its speed (a meaningless mix of "
+                         "unrelated displacements divided by an inflated elapsed time). 110 "
+                         "comfortably covers genuine fast-cell movement while ruling out jumps that "
+                         "large. NOTE: this alone does not stop a track from being absorbed by a "
+                         "static (non-moving) object sitting only a normal, small frame-to-frame "
+                         "distance away -- see --line_stall_window for that separate, still "
+                         "necessary fix; confirmed directly that tightening this value alone did "
+                         "NOT resolve a real 114-frame static-artifact absorption found on real "
+                         "footage, since the erroneous match there was only ~30px, well within any "
+                         "reasonable distance threshold.")
+    ap.add_argument("--line_stall_window", type=float, default=1.0,
+                    help="--count_at_line: if a not-yet-counted line_track hasn't moved more than "
+                         "--line_stall_px from where it was --line_stall_window seconds ago, it's "
+                         "dropped (not counted) rather than left to keep accumulating seen_count. "
+                         "Exists because --line_max_dist alone doesn't stop a real cell's track "
+                         "from being absorbed by a completely static object (dust, debris, an "
+                         "out-of-focus artifact) sitting nearby: MOG2 flags it as genuine "
+                         "foreground and it isn't caught by the separate is_dead classifier either "
+                         "(confirmed directly: is_dead=False for a real 114-consecutive-frame case "
+                         "on real footage, at the exact same pixel every single frame), but a real "
+                         "cell crossing a --line_band_px-wide band should need nowhere near this "
+                         "long -- expected crossing time at typical measured speeds is a handful of "
+                         "frames, roughly an order of magnitude less than this default.")
+    ap.add_argument("--line_stall_px", type=float, default=3.0,
+                    help="--count_at_line: max px of movement over --line_stall_window to still "
+                         "count as genuine progress rather than a stall -- see --line_stall_window. "
+                         "Kept small on purpose: normal per-frame detection jitter is a pixel or two, "
+                         "so this only ever screens out something that is truly not moving, not a "
+                         "slow-but-real cell.")
     ap.add_argument("--line_dedup_window", type=float, default=1.0,
                     help="--count_at_line: max seconds between two in-band sightings for them "
                          "to be treated as the same crossing cell. Should comfortably cover how "
@@ -1389,6 +1428,7 @@ def main():
     next_line_id  = 1
     line_tracks   = {}
     line_max_missed = max(1, round(args.line_dedup_window * fps / max(1, args.frame_stride)))
+    line_stall_frames = max(1, round(args.line_stall_window * fps / max(1, args.frame_stride)))
 
     vw = None
     if args.debug_video:
@@ -1852,19 +1892,20 @@ def main():
 
             # Same two-pass split as the full-frame tracker, and for the same reason:
             # one shared distance can't do both jobs at once. Not-yet-counted tracks
-            # need a GENEROUS radius to bridge real frame-to-frame movement -- measured
-            # speeds up to ~400px/s here, which at a ~0.245s processed-frame gap is up
-            # to ~98px of real displacement, far more than line_dedup_dist (10px
-            # default). Already-counted tracks only need the tight line_dedup_dist to
-            # reclaim their own still-barely-moving object, not to find a genuinely new
-            # detection. Using line_dedup_dist for BOTH (as before) forced a choice
+            # need a generous-but-bounded radius to bridge real frame-to-frame movement
+            # (--line_max_dist -- see its own help for why this is no longer just
+            # --max_dist, which was far looser than justified and confirmed to let
+            # unrelated objects, including static debris, get absorbed into a real
+            # cell's track). Already-counted tracks only need the tight line_dedup_dist
+            # to reclaim their own still-barely-moving object, not to find a genuinely
+            # new detection. Using line_dedup_dist for BOTH (as before) forced a choice
             # between the two: tight enough to stop dense-region merging also broke
             # fast-cell continuity in sparser regions, fragmenting and undercounting
             # real fast crossings there instead.
             uncounted_lt = {tid: st for tid, st in line_tracks.items() if not st["counted"]}
             counted_lt   = {tid: st for tid, st in line_tracks.items() if st["counted"]}
 
-            pairs, unmatched = hungarian_match(uncounted_lt, band_detections, args.max_dist)
+            pairs, unmatched = hungarian_match(uncounted_lt, band_detections, args.line_max_dist)
 
             if counted_lt and unmatched:
                 leftover_idx = sorted(unmatched)
@@ -1888,6 +1929,16 @@ def main():
                 st["end_x"], st["end_y"] = cx, cy
                 st["sum_rx"] += cw / 2.0
                 st["sum_ry"] += ch / 2.0
+                # Stall detection -- see --line_stall_window's help for why this exists
+                # (--line_max_dist alone doesn't stop absorption by a static object sitting
+                # a normal small distance away). Anchor resets every time real progress is
+                # made; if the track is still within --line_stall_px of its anchor after
+                # --line_stall_window seconds, it's flagged so the cleanup pass below drops
+                # it uncounted instead of letting it keep accumulating seen_count forever.
+                if math.hypot(cx - st["stall_x"], cy - st["stall_y"]) > args.line_stall_px:
+                    st["stall_x"], st["stall_y"], st["stall_frame"] = cx, cy, cur_frame
+                elif cur_frame - st["stall_frame"] >= line_stall_frames:
+                    st["stalled"] = True
 
             for j in unmatched:
                 cx, cy, is_streak, is_dead = band_detections[j]
@@ -1898,8 +1949,17 @@ def main():
                     seen_count=1, missed_count=0, is_streak=bool(is_streak),
                     dead_count=1 if is_dead else 0, counted=False,
                     updated=True, start_x=cx, start_y=cy, end_x=cx, end_y=cy,
-                    sum_rx=cw / 2.0, sum_ry=ch / 2.0)
+                    sum_rx=cw / 2.0, sum_ry=ch / 2.0,
+                    stall_x=cx, stall_y=cy, stall_frame=cur_frame, stalled=False)
                 next_line_id += 1
+
+            # A track that never made genuine progress isn't a real crossing -- drop it
+            # before it ever gets a chance to match crossed_exit() below (a stalled object
+            # sitting near the boundary, not actually flowing, could otherwise eventually
+            # satisfy crossed_exit purely by MOG2/watershed noise nudging its reported
+            # position those last few px).
+            for tid in [tid for tid, st in line_tracks.items() if st.get("stalled") and not st["counted"]]:
+                del line_tracks[tid]
 
             # Same "mark counted, don't delete on crossing" fix as the full-frame
             # tracker above -- see that comment for why.
