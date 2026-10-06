@@ -475,6 +475,7 @@ def main():
         resid = a - np.polyval(np.polyfit(f, a, 1), f)
         rows.append(dict(
             track_id=t, n_points=len(f), first_frame=int(f[0]), last_frame=int(f[-1]),
+            start_time_s=f[0] / fps, end_time_s=f[-1] / fps,
             duration_s=(f[-1] - f[0]) / fps,
             start_x=st["pts"][0][3], start_y=st["pts"][0][4],
             end_x=st["pts"][-1][3], end_y=st["pts"][-1][4],
@@ -498,6 +499,10 @@ def main():
             y = solve_height_wall_corrected(v, args.shear_stress_pa / args.medium_viscosity_pa_s, r_m, h_m) if v > 0 else float("nan")
             rows[-1]["est_height_wall_corrected_um"] = y * 1e6 if np.isfinite(y) else float("nan")
             hn = rows[-1]["est_height_naive_um"]
+            # Normalised height from the parabolic (no wall correction) estimate: the
+            # wall-corrected solver has no solution for most cells, which move slower
+            # than its near-wall minimum. 1 = centre one radius above the wall.
+            rows[-1]["height_over_radius"] = hn / rows[-1]["mean_r_um"] if rows[-1]["mean_r_um"] > 0 else float("nan")
             rows[-1]["in_contact"] = int(np.isfinite(hn) and hn <= args.contact_radius_factor * rows[-1]["mean_r_um"])
     df = pd.DataFrame(rows)
     df.to_csv(args.out_csv, index=False)
@@ -527,6 +532,9 @@ def main():
         if len(mv):
             print(f"  moving, reliably tracked: {len(mv)}; in contact with substrate "
                   f"(naive height <= {args.contact_radius_factor}x radius): {100 * mv.in_contact.mean():.0f}%")
+            hr = mv.height_over_radius.dropna()
+            print(f"  height / radius (parabolic), median: {hr.median():.2f} "
+                  f"(p25 {hr.quantile(.25):.2f}, p75 {hr.quantile(.75):.2f})")
 
     if args.validate_window <= 0:
         return
