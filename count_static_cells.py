@@ -7,29 +7,31 @@ Standalone: does not import or change the video counting/tracking scripts.
 How it works
   1. Crop to the image area: rows/columns that are much darker than the rest (video
      player bars, black borders) are trimmed automatically (or give --crop).
-  2. Each cell is a bright halo ring roughly one cell diameter across. The image is
-     resampled so a cell is ~7 px wide, and a difference-of-Gaussians (DoG) tuned to
-     that size turns every halo into one positive peak, also when cells touch.
-     Peaks above --threshold grey levels are counted as cells.
-  3. Strong negative peaks (dark cells with little or no halo: dead, debris or out of
-     focus) are counted separately as "dark spots", not as cells. A bright peak right
-     beside a dark spot is that dark cell's halo and is not counted as a cell.
+  2. The image is resampled so a cell is ~7 px wide. Local contrast energy (RMS of
+     the background-subtracted image over a cell-sized patch) gives one peak per
+     cell whether the cell looks bright (halo ring) or dark (dark body), and also
+     when cells touch. Peaks above the threshold are counted.
+  3. Each cell is labelled "bright" or "dark" by whether its centre is brighter or
+     darker than the background; both count as cells.
 
 The cell diameter in pixels is estimated from the image (autocorrelation of the
 high-passed image) unless you give --cell_diameter_px. It depends on how much the
 image was enlarged: ~7 px in a 330 px-wide thumbnail, ~37-40 px in an 1800 px-wide
-screenshot. Count single frames, not a montage of several frames.
+screenshot. For a slide or figure with several pictures, use --panels; give
+--cell_diameter_px then, as small pictures are too small to estimate it reliably.
 
-Accuracy, checked by eye on two 1800 px screenshots: most cells are found; touching
-pairs are sometimes counted as one, and faint halo rings or debris are sometimes
-counted as a cell, so expect roughly +-10-15%. Always look at the overlay.
+Accuracy: on in-focus images, within ~5-10% of hand counts of test patches (dense
+and sparse). It does NOT work on out-of-focus images where each cell is a set of
+large concentric rings -- every ring arc is counted, giving several times too many.
+Always look at the overlay.
 
 Usage
   python3 count_static_cells.py image1.png [image2.webp ...] --out_dir counts/
-  python3 count_static_cells.py frame.png --cell_diameter_px 38 --threshold 8
+  python3 count_static_cells.py frame.png --cell_diameter_px 38 --threshold 10
+  python3 count_static_cells.py slide.png --panels --cell_diameter_px 7   # several pictures
 
-Outputs, per image: <name>_count.png (green = cell, magenta = dark spot) and
-<name>_cells.csv (x, y, kind); plus counts_summary.csv for all images. Default
+Outputs, per image: <name>_count.png (green = bright cell, magenta = dark cell) and
+<name>_cells.csv (panel, x, y, kind); plus counts_summary.csv for all images. Default
 --out_dir is a "static_counts" folder next to the first image.
 """
 import argparse
@@ -61,12 +63,9 @@ def auto_crop(gray, frac=0.8):
     return x0, y0, x1 - x0, y1 - y0
 
 
-REF_D = 7.0   # cell diameter (px) the detector is tuned for; images are resampled to it
-SIGMA = 1.5   # DoG inner sigma at REF_D
-
-
-def dog(g, s1):
-    return cv2.GaussianBlur(g, (0, 0), s1) - cv2.GaussianBlur(g, (0, 0), 2.5 * s1)
+REF_D = 7.0     # cell diameter (px) the detector is tuned for; images are resampled to it
+HP_SIGMA = 4.0  # background removal scale at REF_D
+NMS = 2         # minimum peak separation (px at REF_D); touching cells are ~REF_D apart
 
 
 def estimate_diameter(g):
@@ -86,6 +85,60 @@ def estimate_diameter(g):
     return float(below[0] + 1) if len(below) else REF_D
 
 
+def find_panels(gray, min_frac=0.01):
+    """Separate pictures on a slide/figure: large non-white regions, left-to-right
+    within rows, top to bottom. Returns a list of (x, y, w, h), inset by 4 px."""
+    m = (gray < 200).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((15, 15), np.uint8))
+    _, _, st, _ = cv2.connectedComponentsWithStats(m)
+    boxes = [tuple(int(v) for v in s[:4]) for s in st[1:] if s[4] >= min_frac * gray.size]
+    # pictures are roughly camera-shaped; drop banners, diagrams and text blocks
+    boxes = [b for b in boxes if 0.5 <= b[2] / b[3] <= 2.5]
+    if not boxes:
+        return []
+    # group into rows by vertical centre, then left to right
+    hmed = np.median([b[3] for b in boxes])
+    boxes.sort(key=lambda b: b[1] + b[3] / 2)
+    rows, cur = [], [boxes[0]]
+    for b in boxes[1:]:
+        if b[1] + b[3] / 2 - (cur[0][1] + cur[0][3] / 2) > 0.5 * hmed:
+            rows.append(cur)
+            cur = []
+        cur.append(b)
+    rows.append(cur)
+    boxes = [b for row in rows for b in sorted(row, key=lambda b: b[0])]
+    return [(x + 4, y + 4, w - 8, h - 8) for x, y, w, h in boxes]
+
+
+def detect(g, args):
+    """Cells in grey image g -> (bright yx array, dark yx array, diameter px)."""
+    d = args.cell_diameter_px or estimate_diameter(g)
+    # Resample so a cell is REF_D px across, where the detector settings were checked
+    # against hand counts.
+    k = REF_D / d
+    gs = cv2.resize(g, None, fx=k, fy=k, interpolation=cv2.INTER_AREA if k < 1 else cv2.INTER_CUBIC)
+    # Sharp, zoomed-in sources keep each cell's bright/dark sub-structure after
+    # resampling, which needs a bit more smoothing to stay one peak per cell.
+    smooth = args.smooth or (1.4 if k < 0.5 else 1.0)
+    # Local contrast energy: RMS of the high-passed image over a cell-sized patch. A
+    # cell gives one energy peak whatever it looks like -- bright ring, dark body, or
+    # both -- so a dark cell's halo or a bright cell's dark centre is not a 2nd object.
+    hp = gs - cv2.GaussianBlur(gs, (0, 0), HP_SIGMA)
+    e = np.sqrt(cv2.GaussianBlur(hp * hp, (0, 0), smooth))
+    mx = ndi.maximum_filter(e, size=2 * NMS + 1)
+    pk = np.argwhere((e == mx) & (e > 1))
+    hts = e[pk[:, 0], pk[:, 1]]
+    # threshold: a fixed floor, raised in high-contrast images to a fraction of the
+    # strongest peaks so background texture is not counted
+    thr = max(args.threshold, args.rel_threshold * np.percentile(hts, 95)) if len(hts) else args.threshold
+    pk = pk[hts > thr]
+    hh, ww = gs.shape
+    pk = pk[(pk[:, 0] >= 2) & (pk[:, 0] < hh - 2) & (pk[:, 1] >= 2) & (pk[:, 1] < ww - 2)]
+    # appearance: centre darker than the local background -> "dark" cell
+    centre = cv2.GaussianBlur(hp, (0, 0), 1.0)[pk[:, 0], pk[:, 1]]
+    return pk[centre >= 0] / k, pk[centre < 0] / k, d
+
+
 def count_image(path, args):
     im = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if im is None:
@@ -95,64 +148,46 @@ def count_image(path, args):
     bgr = im[:, :, :3]
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
-    if args.crop:
-        x0, y0, w, h = [int(v) for v in args.crop.split(",")]
+    if args.panels:
+        regions = find_panels(gray)
+        if not regions:
+            raise SystemExit(f"{path}: no pictures found on a white background")
+    elif args.crop:
+        regions = [tuple(int(v) for v in args.crop.split(","))]
     elif args.no_autocrop:
-        x0, y0, w, h = 0, 0, gray.shape[1], gray.shape[0]
+        regions = [(0, 0, gray.shape[1], gray.shape[0])]
     else:
-        x0, y0, w, h = auto_crop(gray)
-    g = gray[y0:y0 + h, x0:x0 + w]
-
-    d = args.cell_diameter_px or estimate_diameter(g)
-    # Resample so a cell is REF_D px across, where the detector settings were checked
-    # by eye; at high zoom a cell's own bright/dark sub-structure would otherwise
-    # split it into several peaks.
-    k = REF_D / d
-    gs = cv2.resize(g, None, fx=k, fy=k, interpolation=cv2.INTER_AREA if k < 1 else cv2.INTER_CUBIC)
-    r = dog(gs, SIGMA)
-    md = max(1, int(round(args.min_dist_frac * REF_D)))
-    edge = 2  # ignore peaks hugging the crop edge
-    h, w = gs.shape
-
-    mx = ndi.maximum_filter(r, size=2 * md + 1)
-    cells = np.argwhere((r == mx) & (r > args.threshold))
-    mn = ndi.minimum_filter(r, size=2 * md + 1)
-    dark = np.argwhere((r == mn) & (r < -args.dark_threshold))
-    inside = lambda p: p[(p[:, 0] >= edge) & (p[:, 0] < h - edge) & (p[:, 1] >= edge) & (p[:, 1] < w - edge)]
-    cells, dark = inside(cells), inside(dark)
-    if len(cells) and len(dark):
-        dist = np.sqrt(((dark[:, None, :] - cells[None, :, :]) ** 2).sum(-1))
-        # a dark peak right at a bright peak is that cell's own dark centre -> drop it
-        dark = dark[dist.min(1) > 0.35 * REF_D]
-        dist = np.sqrt(((dark[:, None, :] - cells[None, :, :]) ** 2).sum(-1))
-        # a bright peak just beside a dark spot is the dark cell's halo, not a second
-        # cell -> drop the bright peak (a touching neighbour sits ~1 diameter away)
-        if len(dark):
-            cells = cells[dist.min(0) > 0.7 * REF_D]
-    cells, dark = cells / k, dark / k          # back to original-image pixels
-    h, w = g.shape
+        regions = [auto_crop(gray)]
 
     stem = os.path.splitext(os.path.basename(path))[0]
     vis = bgr.copy()
-    cv2.rectangle(vis, (x0, y0), (x0 + w - 1, y0 + h - 1), (0, 200, 255), 1)
-    rad = max(2, int(round(0.45 * d)))
-    lw = 1 if d < 15 else 2
-    for py, px in cells:
-        cv2.circle(vis, (int(px + x0), int(py + y0)), rad, (0, 255, 0), lw)
-    for py, px in dark:
-        cv2.circle(vis, (int(px + x0), int(py + y0)), rad, (255, 0, 255), lw)
-    label = f"cells: {len(cells)}   dark spots: {len(dark)}"
-    fs = max(0.6, w / 1500)
-    cv2.putText(vis, label, (x0 + 8, y0 + int(30 * fs)), 0, fs, (0, 0, 0), int(5 * fs) + 1)
-    cv2.putText(vis, label, (x0 + 8, y0 + int(30 * fs)), 0, fs, (0, 255, 255), max(1, int(2 * fs)))
+    rows, points = [], []
+    for i, (x0, y0, w, h) in enumerate(regions):
+        cells, dark, d = detect(gray[y0:y0 + h, x0:x0 + w], args)
+        name = f"panel {i + 1}" if args.panels else ""
+        rad = max(2, int(round(0.45 * d)))
+        lw = 1 if d < 15 else 2
+        cv2.rectangle(vis, (x0, y0), (x0 + w - 1, y0 + h - 1), (0, 200, 255), 1)
+        for py, px in cells:
+            cv2.circle(vis, (int(px + x0), int(py + y0)), rad, (0, 255, 0), lw)
+        for py, px in dark:
+            cv2.circle(vis, (int(px + x0), int(py + y0)), rad, (255, 0, 255), lw)
+        label = (f"{i + 1}: {len(cells) + len(dark)}" if args.panels else
+                 f"cells: {len(cells) + len(dark)}  (bright {len(cells)}, dark {len(dark)})")
+        fs = max(0.5, w / 1500 if not args.panels else w / 600)
+        cv2.putText(vis, label, (x0 + 6, y0 + int(28 * fs)), 0, fs, (0, 0, 0), int(5 * fs) + 1)
+        cv2.putText(vis, label, (x0 + 6, y0 + int(28 * fs)), 0, fs, (0, 255, 255), max(1, int(2 * fs)))
+        points += [(name, int(px + x0), int(py + y0), "bright") for py, px in cells]
+        points += [(name, int(px + x0), int(py + y0), "dark") for py, px in dark]
+        rows.append(dict(image=path, panel=i + 1 if args.panels else "",
+                         cells=len(cells) + len(dark), bright=len(cells), dark=len(dark),
+                         cell_diameter_px=round(d, 1), region=f"{x0},{y0},{w},{h}"))
     cv2.imwrite(os.path.join(args.out_dir, f"{stem}_count.png"), vis)
     with open(os.path.join(args.out_dir, f"{stem}_cells.csv"), "w", newline="") as f:
         wr = csv.writer(f)
-        wr.writerow(["x", "y", "kind"])
-        wr.writerows([(int(px + x0), int(py + y0), "cell") for py, px in cells])
-        wr.writerows([(int(px + x0), int(py + y0), "dark_spot") for py, px in dark])
-    return dict(image=path, cells=len(cells), dark_spots=len(dark),
-                cell_diameter_px=round(d, 1), crop=f"{x0},{y0},{w},{h}")
+        wr.writerow(["panel", "x", "y", "kind"])
+        wr.writerows(points)
+    return rows
 
 
 def main():
@@ -162,15 +197,19 @@ def main():
                     help="Default: static_counts/ next to the first image.")
     ap.add_argument("--cell_diameter_px", type=float, default=None,
                     help="Cell (halo) diameter in pixels; estimated from the image if omitted.")
-    ap.add_argument("--threshold", type=float, default=6.0,
-                    help="Minimum DoG peak height in grey levels for a cell. Lower = more "
-                         "faint cells but also faint halo rings and specks; higher = fewer "
-                         "false cells but dim cells are missed.")
-    ap.add_argument("--min_dist_frac", type=float, default=0.3,
-                    help="Minimum distance between two counted cells, as a fraction of the "
-                         "diameter. Larger merges touching cells; smaller splits single cells.")
-    ap.add_argument("--dark_threshold", type=float, default=10.0,
-                    help="Minimum negative DoG peak depth (grey levels) for a dark spot.")
+    ap.add_argument("--threshold", type=float, default=8.0,
+                    help="Minimum local contrast (RMS grey levels) for a cell. Lower = more "
+                         "faint cells but also more specks/halo arcs; higher = the reverse.")
+    ap.add_argument("--rel_threshold", type=float, default=0.35,
+                    help="Also require this fraction of the image's 95th-percentile peak "
+                         "contrast, so texture in high-contrast images is not counted.")
+    ap.add_argument("--smooth", type=float, default=None,
+                    help="Contrast-energy smoothing (px at a 7 px cell). Default 1.4 for "
+                         "zoomed-in screenshots (cells > 14 px), else 1.0. Raise it if single "
+                         "cells get two circles; lower it if touching cells get only one.")
+    ap.add_argument("--panels", action="store_true",
+                    help="The image is a slide/figure with several pictures on a white "
+                         "background: find each picture and count it separately.")
     ap.add_argument("--crop", default=None, help="x,y,w,h region to count (default: automatic).")
     ap.add_argument("--no_autocrop", action="store_true")
     args = ap.parse_args()
@@ -178,14 +217,15 @@ def main():
         args.out_dir = os.path.join(os.path.dirname(os.path.abspath(args.images[0])), "static_counts")
     os.makedirs(args.out_dir, exist_ok=True)
 
-    rows = [count_image(p, args) for p in args.images]
+    rows = [r for p in args.images for r in count_image(p, args)]
     with open(os.path.join(args.out_dir, "counts_summary.csv"), "w", newline="") as f:
         wr = csv.DictWriter(f, fieldnames=list(rows[0]))
         wr.writeheader()
         wr.writerows(rows)
     for r in rows:
-        print(f"{r['image']}: {r['cells']} cells, {r['dark_spots']} dark spots "
-              f"(cell diameter {r['cell_diameter_px']} px, counted region x,y,w,h = {r['crop']})")
+        where = f" panel {r['panel']}" if r["panel"] != "" else ""
+        print(f"{r['image']}{where}: {r['cells']} cells ({r['bright']} bright, {r['dark']} dark) "
+              f"(cell diameter {r['cell_diameter_px']} px, region x,y,w,h = {r['region']})")
     print(f"Overlays and per-cell CSVs in {args.out_dir}/")
 
 
