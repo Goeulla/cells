@@ -44,11 +44,13 @@ from scipy import ndimage as ndi
 
 
 def auto_crop(gray, frac=0.8):
-    """Longest run of rows and of columns whose mean brightness is >= frac x the
-    median row/column mean -- trims dark player bars and black borders."""
-    def run(prof):
-        ok = prof >= frac * np.median(prof)
-        best, s = (0, len(prof)), None
+    """Longest run of rows and of columns that belong to the picture -- trims video
+    player bars and black borders. A row/column counts as picture if it is not much
+    darker than typical (mean >= frac x median) OR it has texture (std >= half the
+    typical std), so a vignetted but cell-filled edge is kept."""
+    def run(mean, std):
+        ok = (mean >= frac * np.median(mean)) | (std >= 0.5 * np.median(std))
+        best, s = (0, len(mean)), None
         best_len = 0
         for i, v in enumerate(np.append(ok, False)):
             if v and s is None:
@@ -58,8 +60,8 @@ def auto_crop(gray, frac=0.8):
                     best, best_len = (s, i), i - s
                 s = None
         return best
-    y0, y1 = run(gray.mean(1))
-    x0, x1 = run(gray.mean(0))
+    y0, y1 = run(gray.mean(1), gray.std(1))
+    x0, x1 = run(gray.mean(0), gray.std(0))
     return x0, y0, x1 - x0, y1 - y0
 
 
